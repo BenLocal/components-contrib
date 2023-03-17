@@ -15,10 +15,10 @@ package kafka
 
 import (
 	"context"
-	"os"
-	"os/signal"
+	"errors"
 	"strings"
-	"syscall"
+	"sync"
+	"sync/atomic"
 
 	"github.com/dapr/kit/logger"
 
@@ -36,21 +36,25 @@ type Binding struct {
 	publishTopic string
 	topics       []string
 	logger       logger.Logger
+	closeCh      chan struct{}
+	closed       atomic.Bool
+	wg           sync.WaitGroup
 }
 
 // NewKafka returns a new kafka binding instance.
-func NewKafka(logger logger.Logger) *Binding {
+func NewKafka(logger logger.Logger) bindings.InputOutputBinding {
 	k := kafka.NewKafka(logger)
 	// in kafka binding component, disable consumer retry by default
 	k.DefaultConsumeRetryEnabled = false
 	return &Binding{
-		kafka:  k,
-		logger: logger,
+		kafka:   k,
+		logger:  logger,
+		closeCh: make(chan struct{}),
 	}
 }
 
-func (b *Binding) Init(metadata bindings.Metadata) error {
-	err := b.kafka.Init(metadata.Properties)
+func (b *Binding) Init(ctx context.Context, metadata bindings.Metadata) error {
+	err := b.kafka.Init(ctx, metadata.Properties)
 	if err != nil {
 		return err
 	}
@@ -72,42 +76,52 @@ func (b *Binding) Operations() []bindings.OperationKind {
 	return []bindings.OperationKind{bindings.CreateOperation}
 }
 
-func (p *Binding) Close() (err error) {
-	return p.kafka.Close()
+func (b *Binding) Close() (err error) {
+	if b.closed.CompareAndSwap(false, true) {
+		close(b.closeCh)
+	}
+	defer b.wg.Wait()
+	return b.kafka.Close()
 }
 
-func (b *Binding) Invoke(_ context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
-	err := b.kafka.Publish(b.publishTopic, req.Data, req.Metadata)
+func (b *Binding) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
+	err := b.kafka.Publish(ctx, b.publishTopic, req.Data, req.Metadata)
 	return nil, err
 }
 
-func (b *Binding) Read(handler bindings.Handler) error {
+func (b *Binding) Read(ctx context.Context, handler bindings.Handler) error {
+	if b.closed.Load() {
+		return errors.New("error: binding is closed")
+	}
+
 	if len(b.topics) == 0 {
 		b.logger.Warnf("kafka binding: no topic defined, input bindings will not be started")
 		return nil
 	}
 
-	ah := adaptHandler(handler)
+	handlerConfig := kafka.SubscriptionHandlerConfig{
+		IsBulkSubscribe: false,
+		Handler:         adaptHandler(handler),
+	}
 	for _, t := range b.topics {
-		b.kafka.AddTopicHandler(t, ah)
+		b.kafka.AddTopicHandler(t, handlerConfig)
 	}
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		// Wait for context cancelation or closure.
+		select {
+		case <-ctx.Done():
+		case <-b.closeCh:
+		}
 
-	// Subscribe, in a background goroutine
-	err := b.kafka.Subscribe(context.Background())
-	if err != nil {
-		return err
-	}
+		// Remove the topic handlers.
+		for _, t := range b.topics {
+			b.kafka.RemoveTopicHandler(t)
+		}
+	}()
 
-	// Wait until we exit
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT)
-	<-sigCh
-
-	return nil
+	return b.kafka.Subscribe(ctx)
 }
 
 func adaptHandler(handler bindings.Handler) kafka.EventHandler {

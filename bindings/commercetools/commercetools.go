@@ -17,16 +17,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/dapr/components-contrib/bindings"
 	"github.com/dapr/kit/logger"
 
-	"github.com/labd/commercetools-go-sdk/commercetools"
+	"github.com/labd/commercetools-go-sdk/platform"
+	"golang.org/x/oauth2/clientcredentials"
 )
 
 type Binding struct {
-	client *commercetools.Client
-	logger logger.Logger
+	client     *platform.Client
+	logger     logger.Logger
+	projectKey string
 }
 
 type Data struct {
@@ -43,24 +46,32 @@ type commercetoolsMetadata struct {
 	scopes       string
 }
 
-func NewCommercetools(logger logger.Logger) *Binding {
+func NewCommercetools(logger logger.Logger) bindings.OutputBinding {
 	return &Binding{logger: logger}
 }
 
 // Init does metadata parsing and connection establishment.
-func (ct *Binding) Init(metadata bindings.Metadata) error {
+func (ct *Binding) Init(_ context.Context, metadata bindings.Metadata) error {
 	commercetoolsM, err := ct.getCommercetoolsMetadata(metadata)
 	if err != nil {
 		return err
 	}
+	ct.projectKey = commercetoolsM.projectKey
+
+	// The helper method NewClientEndpoint no longer exists, so URLs need to be manually constructed.
+	// Reference: https://github.com/labd/commercetools-go-sdk/blob/15f4e7e85260cf206301504dced00a8bbf4d8682/commercetools/client.go#L115
+
+	baseURLdomain := fmt.Sprintf("%s.%s.commercetools.com", commercetoolsM.region, commercetoolsM.provider)
+	authURL := fmt.Sprintf("https://auth.%s/oauth/token", baseURLdomain)
+	apiURL := fmt.Sprintf("https://api.%s", baseURLdomain)
 
 	// Create the new client. When an empty value is passed it will use the CTP_*
 	// environment variables to get the value. The HTTPClient arg is optional,
 	// and when empty will automatically be created using the env values.
-	client, err := commercetools.NewClient(&commercetools.ClientConfig{
-		ProjectKey: commercetoolsM.projectKey,
-		Endpoints:  commercetools.NewClientEndpoints(commercetoolsM.region, commercetoolsM.provider),
-		Credentials: &commercetools.ClientCredentials{
+	client, err := platform.NewClient(&platform.ClientConfig{
+		URL: apiURL,
+		Credentials: &clientcredentials.Config{
+			TokenURL:     authURL,
 			ClientID:     commercetoolsM.clientID,
 			ClientSecret: commercetoolsM.clientSecret,
 			Scopes:       []string{commercetoolsM.scopes},
@@ -84,11 +95,13 @@ func (ct *Binding) Operations() []bindings.OperationKind {
 // Invoke is triggered from Dapr.
 func (ct *Binding) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
 	var reqData Data
-	json.Unmarshal(req.Data, &reqData)
+	err := json.Unmarshal(req.Data, &reqData)
+	if err != nil {
+		return nil, err
+	}
 	query := reqData.Query
 
 	res := &bindings.InvokeResponse{Data: nil, Metadata: nil}
-	var err error
 
 	if len(reqData.CommercetoolsAPI) > 0 {
 		ct.logger.Infof("commercetoolsAPI: %s", reqData.CommercetoolsAPI)
@@ -114,14 +127,15 @@ func handleGraphQLQuery(ctx context.Context, ct *Binding, query string) (*bindin
 	res := &bindings.InvokeResponse{Data: nil, Metadata: nil}
 
 	if len(query) > 0 {
-		gql := ct.client.NewGraphQLQuery(query)
-		var gqlResp interface{}
-		errGQL := gql.Execute(&gqlResp)
+		gql := ct.client.WithProjectKey(ct.projectKey).Graphql().Post(platform.GraphQLRequest{
+			Query: query,
+		})
+		gqlResp, errGQL := gql.Execute(ctx)
 		if errGQL != nil {
 			return nil, errors.New("commercetools error: Error executing the provided GraphQL query")
 		}
 
-		bQuery, errM := json.Marshal(gqlResp)
+		bQuery, errM := json.Marshal(gqlResp.Data)
 		if errM != nil {
 			return nil, errors.New("commercetools error: Error marshalling GraphQL query result")
 		}

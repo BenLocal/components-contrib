@@ -18,117 +18,84 @@ on:
     types: [certification-test]
   workflow_dispatch:
   schedule:
-    - cron: '5 */12 * * *'
+    - cron: '25 */8 * * *'
+  push:
+    branches:
+      - 'release-*'
   pull_request:
     branches:
-      - master
-      - release-*
+      # TODO: REMOVE "master" BEFORE MERGING
+      - 'master'
+      - 'release-*'
 
 jobs:
-  pre_job:
-    name: Skip Duplicate Actions
-    runs-on: ubuntu-latest
-    outputs:
-      should_skip: ${{ steps.skip_check.outputs.should_skip }}
-    steps:
-      - id: skip_check
-        uses: fkirc/skip-duplicate-actions@v3.4.0
-        with:
-          cancel_others: 'true'
-          paths_ignore: '["**.md", ".codecov.yaml", ".github/workflows/dapr-automerge.yml"]'
   # Based on whether this is a PR or a scheduled run, we will run a different
   # subset of the certification tests. This allows all the tests not requiring
   # secrets to be executed on pull requests.
   generate-matrix:
-    runs-on: ubuntu-latest
-    needs: pre_job
-    if: needs.pre_job.outputs.should_skip != 'true' || github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-22.04
     steps:
-    - name: Install yq
+    - name: Parse repository_dispatch payload
+      if: github.event_name == 'repository_dispatch'
+      working-directory: ${{ github.workspace }}
       run: |
-        sudo snap install yq
-
-    - name: Specify components that can be run on every PR
-      id: pr-components
-      run: |
-        PR_COMPONENTS=$(yq -I0 --tojson eval - << EOF
-        - pubsub.kafka
-        - pubsub.rabbitmq
-        - pubsub.mqtt
-        - state.redis
-        - state.postgresql
-        - bindings.alicloud.dubbo
-        - bindings.kafka
-        EOF
-        )
-        echo "::set-output name=pr-components::$PR_COMPONENTS"
-
-    - name: Specify components requiring cloud resources to run
-      id: cloud-components
-      run: |
-        # Skip cloud-components on PRs, requires scheduled run trigger
-        # or approver to trigger via respository-dispatch on /ok-to-test
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          echo "::set-output name=cloud-components::[]"
-          exit
+        if [ ${{ github.event.client_payload.command }} = "ok-to-test" ]; then
+          echo "CHECKOUT_REF=${{ github.event.client_payload.pull_head_ref }}" >> $GITHUB_ENV
+          echo "PR_NUMBER=${{ github.event.client_payload.issue.number }}" >> $GITHUB_ENV
         fi
-        # Reuse the same cloud infrastructure as conformance.yml
-        #
-        # Unfortunately, Azure secrets can't have underscores in
-        # names, while environment variables with hyphens ('-') are
-        # troublesome.
-        #
-        # We work around here by leveraging the fact that
-        # environment variable names are case sensitive, so
-        # CamelCase would still work.
-        #
-        # That is slightly better than something like
-        # AZURECOSMOSDBMASTERKEY, which is extremely hard to read
-        # and errorprone.
-        #
-        # Only list the secrets you need for the component.
-        CRON_COMPONENTS=$(yq -I0 --tojson eval - << EOF
-        - component: secretstores.azure.keyvault
-          required-secrets: AzureKeyVaultName,AzureKeyVaultSecretStoreTenantId,AzureKeyVaultSecretStoreClientId,AzureKeyVaultSecretStoreServicePrincipalClientId,AzureKeyVaultSecretStoreServicePrincipalClientSecret,AzureContainerRegistryName,AzureResourceGroupName
-          required-certs: AzureKeyVaultSecretStoreCert
-        - component: state.sqlserver
-          required-secrets: AzureSqlServerConnectionString
-        - component: bindings.azure.servicebusqueues
-          required-secrets: AzureServiceBusConnectionString
-        - component: bindings.azure.cosmosdb
-          required-secrets: AzureCosmosDBUrl,AzureCosmosDB,AzureCosmosDBCollection,AzureCosmosDBMasterKey,AzureCertificationTenantId,AzureCertificationServicePrincipalClientId,AzureCertificationServicePrincipalClientSecret
-        - component: bindings.azure.eventhubs
-          required-secrets: AzureEventHubsBindingsConnectionString,AzureBlobStorageAccount,AzureBlobStorageAccessKey,AzureEventHubsBindingsHub,AzureEventHubsBindingsNamespace,AzureEventHubsBindingsConsumerGroup,AzureCertificationServicePrincipalClientId,AzureCertificationTenantId,AzureCertificationServicePrincipalClientSecret,AzureResourceGroupName,AzureCertificationSubscriptionId,AzureEventHubsBindingsContainer,AzureIotHubEventHubConnectionString,AzureIotHubName,AzureIotHubBindingsConsumerGroup
-        - component: pubsub.azure.eventhubs
-          required-secrets: AzureEventHubsPubsubTopicActiveConnectionString,AzureEventHubsPubsubNamespace,AzureEventHubsPubsubNamespaceConnectionString,AzureBlobStorageAccount,AzureBlobStorageAccessKey,AzureEventHubsPubsubContainer,AzureIotHubName,AzureIotHubEventHubConnectionString,AzureCertificationTenantId,AzureCertificationServicePrincipalClientId,AzureCertificationServicePrincipalClientSecret,AzureResourceGroupName,AzureCertificationSubscriptionId
-        - component: bindings.azure.blobstorage
-          required-secrets: AzureBlobStorageAccount,AzureBlobStorageAccessKey,AzureBlobStorageContainer,AzureCertificationTenantId,AzureCertificationServicePrincipalClientId,AzureCertificationServicePrincipalClientSecret
-        - component: bindings.azure.storagequeues
-          required-secrets: AzureBlobStorageAccount, AzureBlobStorageAccessKey
-        - component: state.azure.tablestorage
-          required-secrets: AzureBlobStorageAccount, AzureBlobStorageAccessKey, AzureCertificationTenantId, AzureCertificationServicePrincipalClientId, AzureCertificationServicePrincipalClientSecret
-        EOF
-        )
-        echo "::set-output name=cloud-components::$CRON_COMPONENTS"
+
+    - name: Check out code
+      uses: actions/checkout@v3
+      with:
+        repository: ${{ env.CHECKOUT_REPO }}
+        ref: ${{ env.CHECKOUT_REF }}
+
+    - name: Generate test matrix
+      id: generate-matrix
+      env:
+        VAULT_NAME: ${{ secrets.AZURE_KEYVAULT }}
+      run: |
+        if [ -z "$VAULT_NAME" ]; then
+          # Do not include cloud tests when credentials are not available
+          node .github/scripts/test-info.mjs certification false
+        else
+          # Include cloud tests
+          node .github/scripts/test-info.mjs certification true
+        fi
+
+    - name: Create PR comment
+      if: env.PR_NUMBER != ''
+      uses: artursouza/sticky-pull-request-comment@da9e86aa2a80e4ae3b854d251add33bd6baabcba
+      with:
+        header: ${{ github.run_id }}
+        number: ${{ env.PR_NUMBER }}
+        GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+        message: |
+          # Components certification test
+
+          🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+          Commit ref: ${{ env.CHECKOUT_REF }}
+
     outputs:
-      pr-components: ${{ steps.pr-components.outputs.pr-components }}
-      cloud-components: ${{ steps.cloud-components.outputs.cloud-components }}
+      test-matrix: ${{ steps.generate-matrix.outputs.test-matrix }}
 
   certification:
     name: ${{ matrix.component }} certification
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    env:
+      UNIQUE_ID: ${{github.run_id}}-${{github.run_attempt}}
     defaults:
       run:
         shell: bash
-    needs: generate-matrix
-    env:
-      PROJECT_PATH: ./src/github.com/dapr/components-contrib
+
+    needs: 
+      - generate-matrix
 
     strategy:
       fail-fast: false # Keep running even if one component fails
-      matrix:
-        component: ${{ fromJson(needs.generate-matrix.outputs.pr-components) }}
-        include: ${{ fromJson(needs.generate-matrix.outputs.cloud-components) }}
+      matrix: 
+        include: ${{ fromJson(needs.generate-matrix.outputs.test-matrix) }}
 
     steps:
     - name: Set default payload repo and ref
@@ -144,38 +111,53 @@ jobs:
           echo "CHECKOUT_REF=${{ github.event.client_payload.pull_head_ref }}" >> $GITHUB_ENV
         fi
 
-    - name: Check out code onto GOPATH
-      uses: actions/checkout@v2
+    - name: Check out code
+      uses: actions/checkout@v3
       with:
-        path: ${{ env.PROJECT_PATH }}
         repository: ${{ env.CHECKOUT_REPO }}
         ref: ${{ env.CHECKOUT_REF }}
 
-    - name: Setup test output
+    - name: Configure environment
       run: |
-        export TEST_OUTPUT_FILE_PREFIX=$GITHUB_WORKSPACE/test_report
-        echo "TEST_OUTPUT_FILE_PREFIX=$TEST_OUTPUT_FILE_PREFIX" >> $GITHUB_ENV
+        # Output file
+        echo "TEST_OUTPUT_FILE_PREFIX=$GITHUB_WORKSPACE/test_report" >> $GITHUB_ENV
 
-    - name: Configure certification test path
-      run: |
-        TEST_COMPONENT=$(echo ${{ matrix.component }} | sed -E 's/\./\//g')
-        export TEST_PATH="${PROJECT_PATH}/tests/certification/${TEST_COMPONENT}"
-        echo "TEST_PATH=$TEST_PATH" >> $GITHUB_ENV
+        # Certification test and source path
+        TEST_COMPONENT=$(echo "${{ matrix.component }}" | sed -E 's/\./\//g')
+        echo "TEST_PATH=tests/certification/${TEST_COMPONENT}" >> $GITHUB_ENV
+        SOURCE_PATH="github.com/dapr/components-contrib/${TEST_COMPONENT}"
+        echo "SOURCE_PATH=$SOURCE_PATH" >> $GITHUB_ENV
+        # converts slashes to dots in this string, so that it doesn't consider them sub-folders
+        SOURCE_PATH_LINEAR=$(echo "$SOURCE_PATH" |sed 's#/#\.#g')
+        echo "SOURCE_PATH_LINEAR=$SOURCE_PATH_LINEAR" >> $GITHUB_ENV
+
+        # Current time (used by Terraform)
+        echo "CURRENT_TIME=$(date --rfc-3339=date)" >> ${GITHUB_ENV}
 
     - uses: Azure/login@v1
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
       if: matrix.required-secrets != ''
 
+    # Set this GitHub secret to your KeyVault, and grant the KeyVault policy to your Service Principal:
+    #    az keyvault set-policy -n $AZURE_KEYVAULT --secret-permissions get list --spn $SPN_CLIENT_ID
+    # Using az cli to query keyvault as Azure/get-keyvault-secrets@v1 is deprecated
     - name: Setup secrets
-      uses: Azure/get-keyvault-secrets@v1
-      with:
-        # Set this GitHub secret to your KeyVault, and grant the KeyVault policy to your Service Principal:
-        #    az keyvault set-policy -n $AZURE_KEYVAULT --secret-permissions get list --spn $SPN_CLIENT_ID
-        keyvault: ${{ secrets.AZURE_KEYVAULT }}
-        secrets: ${{ matrix.required-secrets }}
-      id: get-azure-secrets
       if: matrix.required-secrets != ''
+      env:
+        VAULT_NAME: ${{ secrets.AZURE_KEYVAULT }}
+      run: |
+        secrets="${{ matrix.required-secrets }}"
+        for secretName in $(echo -n $secrets | tr ',' ' '); do
+          value=$(az keyvault secret show \
+            --name $secretName \
+            --vault-name $VAULT_NAME \
+            --query value \
+            --output tsv)
+          echo "::add-mask::$value"
+          echo "$secretName=$value" >> $GITHUB_OUTPUT
+          echo "$secretName=$value" >> $GITHUB_ENV
+        done
 
     # Download the required certificates into files, and set env var pointing to their names
     - name: Setup certs
@@ -191,35 +173,76 @@ jobs:
           echo "$CERT_NAME=$CERT_FILE" >> $GITHUB_ENV
         done
 
-    - name: Set up Go
-      uses: actions/setup-go@v2
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2.0.3
+      if: matrix.require-terraform == 'true'
+
+    - name: Set Cloudflare env vars
+      if: matrix.require-cloudflare-credentials == 'true'
+      run: |
+        echo "CLOUDFLARE_ACCOUNT_ID=${{ secrets.CLOUDFLARE_ACCOUNT_ID }}" >> $GITHUB_ENV
+        echo "CLOUDFLARE_API_TOKEN=${{ secrets.CLOUDFLARE_API_TOKEN }}" >> $GITHUB_ENV
+
+    - name: Set AWS env vars
+      if: matrix.require-aws-credentials == 'true'
+      run: |
+        echo "AWS_REGION=us-west-1" >> $GITHUB_ENV
+        echo "AWS_ACCESS_KEY=${{ secrets.AWS_ACCESS_KEY }}" >> $GITHUB_ENV
+        echo "AWS_SECRET_KEY=${{ secrets.AWS_SECRET_KEY }}" >> $GITHUB_ENV
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      if: matrix.require-aws-credentials == 'true'
       with:
-        go-version: '^1.18'
+        aws-access-key-id: "${{ secrets.AWS_ACCESS_KEY }}"
+        aws-secret-access-key: "${{ secrets.AWS_SECRET_KEY }}"
+        aws-region: "${{ env.AWS_REGION }}"
+
+    - name: Set up Go
+      id: setup-go
+      uses: actions/setup-go@v3
+      with:
+        go-version-file: 'go.mod'
 
     - name: Download Go dependencies
       working-directory: ${{ env.TEST_PATH }}
       run: |
         go mod download
         go install gotest.tools/gotestsum@latest
+        go install github.com/axw/gocov/gocov@v1.1.0
 
     - name: Check that go mod tidy is up-to-date
       working-directory: ${{ env.TEST_PATH }}
       run: |
-        go mod tidy -compat=1.18
+        # Get just the major version and major update (e.g. "1.20") from the installed Go version
+        GOVER=$(echo "${{ steps.setup-go.outputs.go-version }}" | cut -d '.' -f 1,2)
+        go mod tidy -compat=$GOVER
         git diff --exit-code ./go.mod
         git diff --exit-code ./go.sum
+
+    - name: Run setup script
+      if: matrix.setup-script != ''
+      run: .github/scripts/components-scripts/${{ matrix.setup-script }}
+
+    - name: Catch setup failures
+      if: failure()
+      run: |
+        echo "CERTIFICATION_FAILURE=true" >> $GITHUB_ENV
 
     - name: Run tests
       continue-on-error: false
       working-directory: ${{ env.TEST_PATH }}
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_KEY }}
+        AWS_REGION: "${{ env.AWS_REGION }}"
       run: |
         echo "Running certification tests for ${{ matrix.component }} ... "
-
+        export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=ignore
         set +e
         gotestsum --jsonfile ${{ env.TEST_OUTPUT_FILE_PREFIX }}_certification.json \
           --junitfile ${{ env.TEST_OUTPUT_FILE_PREFIX }}_certification.xml --format standard-quiet -- \
-          -count=1 -timeout=15m
-
+          -coverprofile=cover.out -covermode=set -tags=certtests -coverpkg=${{ env.SOURCE_PATH }}
         status=$?
         echo "Completed certification tests for ${{ matrix.component }} ... "
         if test $status -ne 0; then
@@ -227,6 +250,12 @@ jobs:
           export CERTIFICATION_FAILURE=true
         fi
         set -e
+
+        COVERAGE_REPORT=$(gocov convert cover.out | gocov report)
+        COVERAGE_LINE=$(echo $COVERAGE_REPORT  | grep -oP '(?<=Total Coverage:).*') # example: "80.00% (40/50)"
+        COVERAGE_PERCENTAGE=$(echo $COVERAGE_LINE | grep -oP '([0-9\.]*)' | head -n 1) # example "80.00"
+        echo "COVERAGE_LINE=$COVERAGE_LINE" >> $GITHUB_ENV
+        echo "COMPONENT_PERCENTAGE=$COVERAGE_PERCENTAGE" >> $GITHUB_ENV
 
         # Fail the step if we found no test to run
         if grep -q "\[no test files\]" ${{ env.TEST_OUTPUT_FILE_PREFIX }}_certification.json ; then
@@ -238,12 +267,57 @@ jobs:
           CERT_FILE=$(printenv $CERT_NAME)
 
           echo "Cleaning up the certificate file $CERT_FILE..."
-          rm $CERT_FILE
+          rm $CERT_FILE || true
         done
 
         if [[ -v CERTIFICATION_FAILURE ]]; then
+          echo "CERTIFICATION_FAILURE=true" >> $GITHUB_ENV
           exit 1
+        else
+          echo "CERTIFICATION_FAILURE=false" >> $GITHUB_ENV
         fi
+
+    - name: Prepare test result info
+      if: always()
+      run: |
+        mkdir -p tmp/result_files
+        echo "Writing to tmp/result_files/${{ matrix.component }}.txt"
+        if [[ "${{ env.CERTIFICATION_FAILURE }}" == "true" ]]; then
+          echo "0" >> "tmp/result_files/${{ matrix.component }}.txt"
+        else
+          echo "1" >> "tmp/result_files/${{ matrix.component }}.txt"
+        fi
+
+    - name: Upload result files
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: result_files
+        path: tmp/result_files
+        retention-days: 1
+
+    - name: Prepare Cert Coverage Info
+      if: github.event_name == 'schedule'
+      run: |
+       mkdir -p tmp/cov_files
+       echo "${{ env.COVERAGE_LINE }}" >> tmp/cov_files/${{ env.SOURCE_PATH_LINEAR }}.txt
+
+    - name: Upload Cert Coverage Artifact
+      uses: actions/upload-artifact@v3
+      if: github.event_name == 'schedule'
+      with:
+        name: certtest_cov
+        path: tmp/cov_files
+        retention-days: 1
+
+    - name: Component Coverage Discord Notification
+      if: github.event_name == 'schedule'
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_MONITORING_WEBHOOK_URL }}
+      uses: Ilshidur/action-discord@0c4b27844ba47cb1c7bee539c8eead5284ce9fa9
+      continue-on-error: true
+      with:
+        args: 'Cert Test Coverage for {{ SOURCE_PATH }} is {{ COVERAGE_LINE }}'
 
     # Upload logs for test analytics to consume
     - name: Upload test results
@@ -252,3 +326,180 @@ jobs:
       with:
         name: ${{ matrix.component }}_certification_test
         path: ${{ env.TEST_OUTPUT_FILE_PREFIX }}_certification.*
+
+    - name: Run destroy script
+      if: always() && matrix.destroy-script != ''
+      run: .github/scripts/components-scripts/${{ matrix.destroy-script }}
+
+  post_job:
+    name: Post-completion
+    runs-on: ubuntu-22.04
+    if: always()
+    needs: 
+      - certification
+      - generate-matrix
+    steps:
+      - name: Parse repository_dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ ${{ github.event.client_payload.command }} = "ok-to-test" ]; then
+            echo "CHECKOUT_REF=${{ github.event.client_payload.pull_head_ref }}" >> $GITHUB_ENV
+            echo "PR_NUMBER=${{ github.event.client_payload.issue.number }}" >> $GITHUB_ENV
+          fi
+
+      - name: Download test result artifact
+        if: always() && env.PR_NUMBER != ''
+        uses: actions/download-artifact@v3
+        continue-on-error: true
+        id: testresults
+        with:
+          name: result_files
+          path: tmp/result_files
+
+      - name: Build message
+        if: always() && env.PR_NUMBER != ''
+        # Abusing of the github-script action to be able to write this in JS
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const allComponents = JSON.parse('${{ needs.generate-matrix.outputs.test-matrix }}')
+            const basePath = '${{ steps.testresults.outputs.download-path }}'
+            const testType = 'certification'
+
+            const fs = require('fs')
+            const path = require('path')
+
+            let message = `# Components ${testType} test
+
+            🔗 **[Link to Action run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})**
+
+            Commit ref: ${{ env.CHECKOUT_REF }}`
+
+            let allSuccess = true
+            let allFound = true
+            let notSuccess = []
+            let notFound = []
+            for (let i = 0; i < allComponents.length; i++) {
+                let component = allComponents[i]
+                if (!component) {
+                    continue
+                }
+                if (typeof component == 'object') {
+                    component = component.component
+                }
+                let found = false
+                let success = false
+                try {
+                    let read = fs.readFileSync(path.join(basePath, component + '.txt'), 'utf8')
+                    read = read.split('\n')[0]
+                    switch (read) {
+                        case '1':
+                            found = true
+                            success = true
+                            break
+                        case '0':
+                            found = true
+                            success = false
+                    }
+                } catch (e) {
+                    // ignore errors, leave found = false
+                }
+
+                if (!found) {
+                    allFound = false
+                    notFound.push(component)
+                }
+                if (!success) {
+                    allSuccess = false
+                    notSuccess.push(component)
+                }
+            }
+
+            if (allSuccess) {
+                if (allFound) {
+                    message += '\n\n' + `# ✅ All ${testType} tests passed
+
+            All tests have reported a successful status` + '\n\n'
+                } else {
+                    message += '\n\n' + `# ⚠️ Some ${testType} tests did not report status
+
+            Although there were no failures reported, some tests did not report a status:` + '\n\n'
+                    for (let i = 0; i < notFound.length; i++) {
+                        message += '- ' + notFound[i] + '\n'
+                    }
+                    message += '\n'
+                }
+            } else {
+                message += '\n\n' + `# ❌ Some ${testType} tests failed
+
+            These tests failed:` + '\n\n'
+                for (let i = 0; i < notSuccess.length; i++) {
+                    message += '- ' + notSuccess[i] + '\n'
+                }
+                message += '\n'
+
+                if (!allFound) {
+                    message += 'Additionally, some tests did not report a status:\n\n'
+                    for (let i = 0; i < notFound.length; i++) {
+                        message += '- ' + notFound[i] + '\n'
+                    }
+                    message += '\n'
+                }
+            }
+
+            fs.writeFileSync('message.txt', message)
+
+      - name: Replace PR comment
+        if: always() && env.PR_NUMBER != ''
+        uses: artursouza/sticky-pull-request-comment@da9e86aa2a80e4ae3b854d251add33bd6baabcba
+        with:
+          header: ${{ github.run_id }}
+          number: ${{ env.PR_NUMBER }}
+          GITHUB_TOKEN: ${{ secrets.DAPR_BOT_TOKEN }}
+          path: message.txt
+
+      - name: Download Cert Coverage Artifact
+        uses: actions/download-artifact@v3
+        continue-on-error: true
+        if: success() && github.event_name == 'schedule'
+        id: download
+        with:
+          name: certtest_cov
+          path: tmp/cov_files
+
+      - name: Calculate total coverage
+        if: success() && github.event_name == 'schedule'
+        run: |
+          threshold=60.0
+          echo "threshold=$threshold" >> $GITHUB_ENV
+          aboveThreshold=0
+          totalFiles=0
+          ls "${{steps.download.outputs.download-path}}" | while read f; do
+          while read LINE;
+              do
+              ratio=$(echo $LINE | cut -d "(" -f2 | cut -d ")" -f1)
+              prcnt=$(echo $LINE | cut -d "(" -f1 | cut -d ")" -f1)
+              tempPrcnt=$(echo $prcnt | cut -d'%' -f1)
+              if [ $tempPrcnt \> $threshold ]; then aboveThreshold=$(($aboveThreshold+1)); fi
+              totalFiles=$(($totalFiles+1))
+              tempNumerator=$(echo $ratio | cut -d'/' -f1)
+              tempDenominator=$(echo $ratio | cut -d'/' -f2)
+              export numerator=$(($numerator+$tempNumerator))
+              export denominator=$(($denominator+$tempDenominator))
+              totalPer=$(awk "BEGIN { print (($numerator / $denominator) * 100) }")
+              echo "totalPer=$totalPer" >> $GITHUB_ENV
+              echo "aboveThreshold=$aboveThreshold" >> $GITHUB_ENV
+              echo "totalFiles=$totalFiles" >> $GITHUB_ENV
+            done < "${{steps.download.outputs.download-path}}/$f"
+          done
+        continue-on-error: true
+
+      - name: Final Coverage Discord Notification
+        if: success() && github.event_name == 'schedule'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_MONITORING_WEBHOOK_URL }}
+        uses: Ilshidur/action-discord@0c4b27844ba47cb1c7bee539c8eead5284ce9fa9
+        continue-on-error: true
+        with:
+          args: 'Total Coverage for Certification Tests is {{ totalPer }}%. {{ aboveThreshold }} out of {{ totalFiles }} components have certification tests with code coverage > {{ threshold }}%'

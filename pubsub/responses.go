@@ -29,3 +29,56 @@ const (
 type AppResponse struct {
 	Status AppResponseStatus `json:"status"`
 }
+
+// AppBulkResponseEntry Represents single response, as part of AppBulkResponse, to be
+// sent by subscibed App for the corresponding single message during bulk subscribe
+type AppBulkResponseEntry struct {
+	EntryId string            `json:"entryId"` //nolint:stylecheck
+	Status  AppResponseStatus `json:"status"`
+}
+
+// AppBulkResponse is the whole bulk subscribe response sent by App
+type AppBulkResponse struct {
+	AppResponses []AppBulkResponseEntry `json:"statuses"`
+}
+
+// BulkPublishResponseFailedEntry Represents single publish response, as part of BulkPublishResponse
+// to be sent to publishing App for the corresponding single message during bulk publish
+type BulkPublishResponseFailedEntry struct {
+	EntryId string `json:"entryId"` //nolint:stylecheck
+	Error   error  `json:"error"`
+}
+
+// BulkPublishResponse contains the list of failed entries in a bulk publish request.
+type BulkPublishResponse struct {
+	FailedEntries []BulkPublishResponseFailedEntry `json:"failedEntries"`
+}
+
+// BulkSubscribeResponseEntry Represents single subscribe response item, as part of BulkSubscribeResponse
+// to be sent to building block for the corresponding single message during bulk subscribe
+type BulkSubscribeResponseEntry struct {
+	EntryId string `json:"entryId"` //nolint:stylecheck
+	Error   error  `json:"error"`
+}
+
+// BulkSubscribeResponse is the whole bulk subscribe response sent to building block
+type BulkSubscribeResponse struct {
+	Error    error                        `json:"error"`
+	Statuses []BulkSubscribeResponseEntry `json:"statuses"`
+}
+
+// NewBulkPublishResponse returns a BulkPublishResponse with each entry having same error.
+// This method is a helper method to map a single error response on BulkPublish to multiple events.
+func NewBulkPublishResponse(messages []BulkMessageEntry, err error) BulkPublishResponse {
+	response := BulkPublishResponse{}
+	response.FailedEntries = make([]BulkPublishResponseFailedEntry, 0, len(messages))
+	for _, msg := range messages {
+		en := BulkPublishResponseFailedEntry{}
+		en.EntryId = msg.EntryId
+		if err != nil {
+			en.Error = err
+		}
+		response.FailedEntries = append(response.FailedEntries, en)
+	}
+	return response
+}

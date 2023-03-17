@@ -15,9 +15,7 @@ package kafka_test
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net/http"
 	"testing"
 	"time"
 
@@ -48,6 +46,7 @@ import (
 	"github.com/dapr/components-contrib/tests/certification/flow/network"
 	"github.com/dapr/components-contrib/tests/certification/flow/retry"
 	"github.com/dapr/components-contrib/tests/certification/flow/sidecar"
+	"github.com/dapr/components-contrib/tests/certification/flow/simulate"
 	"github.com/dapr/components-contrib/tests/certification/flow/watcher"
 )
 
@@ -71,24 +70,9 @@ const (
 
 var (
 	brokers          = []string{"localhost:19092", "localhost:29092", "localhost:39092"}
-	oauthClientQuery = "https://localhost:4444/clients/dapr"
 )
 
-func TestKafka(t *testing.T) {
-	log := logger.NewLogger("dapr.components")
-	kafka_input_1 := bindings_loader.NewInput("kafka", func() bindings.InputBinding {
-		return bindings_kafka.NewKafka(log)
-	})
-	kafka_output_1 := bindings_loader.NewOutput("kafka", func() bindings.OutputBinding {
-		return bindings_kafka.NewKafka(log)
-	})
-	kafka_input_2 := bindings_loader.NewInput("kafka", func() bindings.InputBinding {
-		return bindings_kafka.NewKafka(log)
-	})
-	kafka_input_3 := bindings_loader.NewInput("kafka", func() bindings.InputBinding {
-		return bindings_kafka.NewKafka(log)
-	})
-
+func TestKafka_with_retry(t *testing.T) {
 	// For Kafka, we should ensure messages are received in order.
 	consumerGroup1 := watcher.NewOrdered()
 	// This watcher is across multiple consumers in the same group
@@ -98,9 +82,15 @@ func TestKafka(t *testing.T) {
 	// Application logic that tracks messages from a topic.
 	application := func(appName string, watcher *watcher.Watcher) app.SetupFn {
 		return func(ctx flow.Context, s common.Service) error {
+			// Simulate periodic errors.
+			sim := simulate.PeriodicError(ctx, 100)
+
 			// Setup the /orders event handler.
 			return multierr.Combine(
 				s.AddBindingInvocationHandler(bindingName, func(_ context.Context, in *common.BindingEvent) (out []byte, err error) {
+					if err := sim(); err != nil {
+						return nil, err
+					}
 					// Track/Observe the data of the event.
 					watcher.Observe(string(in.Data))
 					ctx.Logf("======== %s received event: %s\n", appName, string(in.Data))
@@ -143,6 +133,7 @@ func TestKafka(t *testing.T) {
 			// Send events that the application above will observe.
 			ctx.Log("Sending messages!")
 			for _, msg := range msgs {
+				ctx.Logf("Sending: %q", msg)
 				err := client.InvokeOutputBinding(ctx, &dapr.InvokeBindingRequest{
 					Name:      bindingName,
 					Operation: string(bindings.CreateOperation),
@@ -197,7 +188,7 @@ func TestKafka(t *testing.T) {
 							Metadata:  metadata,
 						})
 					}, bo, func(err error, t time.Duration) {
-						ctx.Logf("Error outpub binding message, retrying in %s", t)
+						ctx.Logf("Error output binding message, retrying in %s", t)
 					}, func() {}); err == nil {
 						for _, m := range watchers {
 							m.Add(msg) // Success
@@ -224,7 +215,7 @@ func TestKafka(t *testing.T) {
 		}
 	}
 
-	flow.New(t, "kafka certification").
+	flow.New(t, "kafka certification with retry").
 		// Run Kafka using Docker Compose.
 		Step(dockercompose.Run(clusterName, dockerComposeYAML)).
 		Step("wait for broker sockets",
@@ -248,25 +239,6 @@ func TestKafka(t *testing.T) {
 
 			return err
 		})).
-		Step("wait for Dapr OAuth client", retry.Do(20*time.Second, 6, func(ctx flow.Context) error {
-			httpClient := &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						InsecureSkipVerify: true, // test server certificate is not trusted.
-					},
-				},
-			}
-
-			resp, err := httpClient.Get(oauthClientQuery)
-			if err != nil {
-				return err
-			}
-			if resp.StatusCode != 200 {
-				return fmt.Errorf("oauth client query for 'dapr' not successful")
-			}
-			return nil
-		})).
-		//
 		// Run the application logic above.
 		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
 			application(appID1, consumerGroup1))).
@@ -277,8 +249,8 @@ func TestKafka(t *testing.T) {
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
-			runtime.WithInputBindings(kafka_input_1),
-			runtime.WithOutputBindings(kafka_output_1))).
+			componentRuntimeOptions(),
+		)).
 		//
 		// Run the second application.
 		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
@@ -286,12 +258,13 @@ func TestKafka(t *testing.T) {
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName2,
-			embedded.WithComponentsPath("./components/mtls-consumer"),
+			embedded.WithComponentsPath("./components/consumer2"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
-			runtime.WithInputBindings(kafka_input_2))).
+			componentRuntimeOptions(),
+		)).
 		//
 		// Send messages using the same metadata/message key so we can expect
 		// in-order processing.
@@ -303,12 +276,13 @@ func TestKafka(t *testing.T) {
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName3,
-			embedded.WithComponentsPath("./components/oauth-consumer"),
+			embedded.WithComponentsPath("./components/consumer2"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
-			runtime.WithInputBindings(kafka_input_3))).
+			componentRuntimeOptions(),
+		)).
 		Step("reset", flow.Reset(consumerGroup2)).
 		//
 		// Send messages with random keys to test message consumption
@@ -366,4 +340,21 @@ func TestKafka(t *testing.T) {
 		Step("wait", flow.Sleep(30*time.Second)).
 		Step("assert messages(consumer rebalance)", assertMessages(consumerGroup2)).
 		Run()
+}
+
+func componentRuntimeOptions() []runtime.Option {
+	log := logger.NewLogger("dapr.components")
+
+	bindingsRegistry := bindings_loader.NewRegistry()
+	bindingsRegistry.Logger = log
+	bindingsRegistry.RegisterInputBinding(func(l logger.Logger) bindings.InputBinding {
+		return bindings_kafka.NewKafka(l)
+	}, "kafka")
+	bindingsRegistry.RegisterOutputBinding(func(l logger.Logger) bindings.OutputBinding {
+		return bindings_kafka.NewKafka(l)
+	}, "kafka")
+
+	return []runtime.Option{
+		runtime.WithBindings(bindingsRegistry),
+	}
 }

@@ -27,6 +27,7 @@ const (
 	key                  = "partitionKey"
 	skipVerify           = "skipVerify"
 	caCert               = "caCert"
+	certificateAuthType  = "certificate"
 	clientCert           = "clientCert"
 	clientKey            = "clientKey"
 	consumeRetryEnabled  = "consumeRetryEnabled"
@@ -45,6 +46,7 @@ type kafkaMetadata struct {
 	AuthType             string
 	SaslUsername         string
 	SaslPassword         string
+	SaslMechanism        string
 	InitialOffset        int64
 	MaxMessageBytes      int
 	OidcTokenEndpoint    string
@@ -106,7 +108,6 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 	if val, ok := metadata["consumerID"]; ok && val != "" {
 		meta.ConsumerGroup = val
 		k.logger.Debugf("Using %s as ConsumerGroup", meta.ConsumerGroup)
-		k.logger.Warn("ConsumerID is deprecated, if ConsumerID and ConsumerGroup are both set, ConsumerGroup is used")
 	}
 
 	if val, ok := metadata["consumerGroup"]; ok && val != "" {
@@ -117,6 +118,11 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 	if val, ok := metadata["clientID"]; ok && val != "" {
 		meta.ClientID = val
 		k.logger.Debugf("Using %s as ClientID", meta.ClientID)
+	}
+
+	if val, ok := metadata["saslMechanism"]; ok && val != "" {
+		meta.SaslMechanism = val
+		k.logger.Debugf("Using %s as saslMechanism", meta.SaslMechanism)
 	}
 
 	initialOffset, err := parseInitialOffset(metadata["initialOffset"])
@@ -132,6 +138,13 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 	}
 
 	k.logger.Debugf("Found brokers: %v", meta.Brokers)
+
+	if val, ok := metadata[caCert]; ok && val != "" {
+		if !isValidPEM(val) {
+			return nil, errors.New("kafka error: invalid ca certificate")
+		}
+		meta.TLSCaCert = val
+	}
 
 	val, ok := metadata["authType"]
 	if !ok {
@@ -155,7 +168,6 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 		} else {
 			return nil, errors.New("kafka error: missing SASL Password for authType 'password'")
 		}
-
 		k.logger.Debug("Configuring SASL password authentication.")
 	case oidcAuthType:
 		meta.AuthType = val
@@ -203,6 +215,12 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 	case noAuthType:
 		meta.AuthType = val
 		k.logger.Debug("No authentication configured.")
+	case certificateAuthType:
+		if meta.TLSCaCert == "" {
+			return nil, errors.New("missing CA certificate property 'caCert' for authType 'certificate'")
+		}
+		meta.AuthType = val
+		k.logger.Debug("Configuring root certificate authentication.")
 	default:
 		return nil, errors.New("kafka error: invalid value for 'authType' attribute")
 	}
@@ -214,13 +232,6 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 		}
 
 		meta.MaxMessageBytes = maxBytes
-	}
-
-	if val, ok := metadata[caCert]; ok && val != "" {
-		if !isValidPEM(val) {
-			return nil, errors.New("kafka error: invalid ca certificate")
-		}
-		meta.TLSCaCert = val
 	}
 
 	if val, ok := metadata["disableTls"]; ok && val != "" {
@@ -272,7 +283,7 @@ func (k *Kafka) getKafkaMetadata(metadata map[string]string) (*kafkaMetadata, er
 		}
 		meta.Version = version
 	} else {
-		meta.Version = sarama.V2_0_0_0
+		meta.Version = sarama.V2_0_0_0 //nolint:nosnakecase
 	}
 
 	return &meta, nil

@@ -14,18 +14,20 @@ limitations under the License.
 package rethinkdb
 
 import (
+	"context"
 	"encoding/json"
-	"io/ioutil"
-	"strconv"
-	"strings"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
 	"time"
 
-	"github.com/agrea/ptr"
 	r "github.com/dancannon/gorethink"
-	"github.com/pkg/errors"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 const (
@@ -44,9 +46,9 @@ type RethinkDB struct {
 }
 
 type stateConfig struct {
-	r.ConnectOpts
-	Archive bool   `json:"archive"`
-	Table   string `json:"table"`
+	r.ConnectOpts `mapstructure:",squash"`
+	Archive       bool   `json:"archive"`
+	Table         string `json:"table"`
 }
 
 type stateRecord struct {
@@ -57,20 +59,20 @@ type stateRecord struct {
 }
 
 // NewRethinkDBStateStore returns a new RethinkDB state store.
-func NewRethinkDBStateStore(logger logger.Logger) *RethinkDB {
+func NewRethinkDBStateStore(logger logger.Logger) state.Store {
 	return &RethinkDB{
-		features: []state.Feature{state.FeatureETag, state.FeatureTransactional},
+		features: []state.Feature{},
 		logger:   logger,
 	}
 }
 
 // Init parses metadata, initializes the RethinkDB client, and ensures the state table exists.
-func (s *RethinkDB) Init(metadata state.Metadata) error {
-	r.Log.Out = ioutil.Discard
+func (s *RethinkDB) Init(ctx context.Context, metadata state.Metadata) error {
+	r.Log.Out = io.Discard
 	r.SetTags("rethinkdb", "json")
 	cfg, err := metadataToConfig(metadata.Properties, s.logger)
 	if err != nil {
-		return errors.Wrap(err, "unable to parse metadata properties")
+		return fmt.Errorf("unable to parse metadata properties: %w", err)
 	}
 
 	// in case someone runs Init multiple times
@@ -79,52 +81,61 @@ func (s *RethinkDB) Init(metadata state.Metadata) error {
 	}
 	ses, err := r.Connect(cfg.ConnectOpts)
 	if err != nil {
-		return errors.Wrap(err, "error connecting to the database")
+		return fmt.Errorf("error connecting to the database: %w", err)
 	}
 
 	s.session = ses
 	s.config = cfg
 
 	// check if table already exists
-	c, err := r.DB(s.config.Database).TableList().Run(s.session)
+	listContext, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	c, err := r.DB(s.config.Database).TableList().Run(s.session, r.RunOpts{Context: listContext})
 	if err != nil {
-		return errors.Wrap(err, "error checking for state table existence in DB")
+		return fmt.Errorf("error checking for state table existence in DB: %w", err)
 	}
 
 	if c == nil {
-		return errors.Wrap(err, "invalid database response, cursor required")
+		return fmt.Errorf("invalid database response, cursor required: %w", err)
 	}
 	defer c.Close()
 
 	var list []string
 	err = c.All(&list)
 	if err != nil {
-		return errors.Wrap(err, "invalid database responsewhile listing tables")
+		return fmt.Errorf("invalid database responsewhile listing tables: %w", err)
 	}
 
 	if !tableExists(list, s.config.Table) {
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 		_, err = r.DB(s.config.Database).TableCreate(s.config.Table, r.TableCreateOpts{
 			PrimaryKey: stateTablePKName,
-		}).RunWrite(s.session)
+		}).RunWrite(s.session, r.RunOpts{Context: cctx})
 		if err != nil {
-			return errors.Wrap(err, "error creating state table in DB")
+			return fmt.Errorf("error creating state table in DB: %w", err)
 		}
 	}
 
 	if s.config.Archive && !tableExists(list, stateArchiveTableName) {
 		// create archive table with autokey to preserve state id
+		ctblCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 		_, err = r.DB(s.config.Database).TableCreate(stateArchiveTableName,
-			r.TableCreateOpts{PrimaryKey: stateArchiveTablePKName}).RunWrite(s.session)
+			r.TableCreateOpts{PrimaryKey: stateArchiveTablePKName}).RunWrite(s.session, r.RunOpts{Context: ctblCtx})
 		if err != nil {
-			return errors.Wrap(err, "error creating state archive table in DB")
+			return fmt.Errorf("error creating state archive table in DB: %w", err)
 		}
+
 		// index archive table for id and timestamp
+		cindCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
 		_, err = r.DB(s.config.Database).Table(stateArchiveTableName).
 			IndexCreateFunc("state_index", func(row r.Term) interface{} {
 				return []interface{}{row.Field("id"), row.Field("timestamp")}
-			}).RunWrite(s.session)
+			}).RunWrite(s.session, r.RunOpts{Context: cindCtx})
 		if err != nil {
-			return errors.Wrap(err, "error creating state archive index in DB")
+			return fmt.Errorf("error creating state archive index in DB: %w", err)
 		}
 	}
 
@@ -147,14 +158,14 @@ func tableExists(arr []string, table string) bool {
 }
 
 // Get retrieves a RethinkDB KV item.
-func (s *RethinkDB) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (s *RethinkDB) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	if req == nil || req.Key == "" {
 		return nil, errors.New("invalid state request, missing key")
 	}
 
-	c, err := r.Table(s.config.Table).Get(req.Key).Run(s.session)
+	c, err := r.Table(s.config.Table).Get(req.Key).Run(s.session, r.RunOpts{Context: ctx})
 	if err != nil {
-		return nil, errors.Wrap(err, "error getting record from the database")
+		return nil, fmt.Errorf("error getting record from the database: %w", err)
 	}
 
 	if c == nil || c.IsNil() {
@@ -168,10 +179,10 @@ func (s *RethinkDB) Get(req *state.GetRequest) (*state.GetResponse, error) {
 	var doc stateRecord
 	err = c.One(&doc)
 	if err != nil {
-		return nil, errors.Wrap(err, "error parsing database content")
+		return nil, fmt.Errorf("error parsing database content: %w", err)
 	}
 
-	resp := &state.GetResponse{ETag: ptr.String(doc.Hash)}
+	resp := &state.GetResponse{ETag: ptr.Of(doc.Hash)}
 	b, ok := doc.Data.([]byte)
 	if ok {
 		resp.Data = b
@@ -187,22 +198,22 @@ func (s *RethinkDB) Get(req *state.GetRequest) (*state.GetResponse, error) {
 }
 
 // BulkGet performs a bulks get operations.
-func (s *RethinkDB) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
+func (s *RethinkDB) BulkGet(ctx context.Context, req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
 	// TODO: replace with bulk get for performance
 	return false, nil, nil
 }
 
 // Set saves a state KV item.
-func (s *RethinkDB) Set(req *state.SetRequest) error {
+func (s *RethinkDB) Set(ctx context.Context, req *state.SetRequest) error {
 	if req == nil || req.Key == "" || req.Value == nil {
 		return errors.New("invalid state request, key and value required")
 	}
 
-	return s.BulkSet([]state.SetRequest{*req})
+	return s.BulkSet(ctx, []state.SetRequest{*req})
 }
 
 // BulkSet performs a bulk save operation.
-func (s *RethinkDB) BulkSet(req []state.SetRequest) error {
+func (s *RethinkDB) BulkSet(ctx context.Context, req []state.SetRequest) error {
 	docs := make([]*stateRecord, len(req))
 	for i, v := range req {
 		var etag string
@@ -221,19 +232,19 @@ func (s *RethinkDB) BulkSet(req []state.SetRequest) error {
 	resp, err := r.Table(s.config.Table).Insert(docs, r.InsertOpts{
 		Conflict:      "replace",
 		ReturnChanges: true,
-	}).RunWrite(s.session)
+	}).RunWrite(s.session, r.RunOpts{Context: ctx})
 	if err != nil {
-		return errors.Wrap(err, "error saving records to the database")
+		return fmt.Errorf("error saving records to the database: %w", err)
 	}
 
 	if s.config.Archive && len(resp.Changes) > 0 {
-		s.archive(resp.Changes)
+		s.archive(ctx, resp.Changes)
 	}
 
 	return nil
 }
 
-func (s *RethinkDB) archive(changes []r.ChangeResponse) error {
+func (s *RethinkDB) archive(ctx context.Context, changes []r.ChangeResponse) error {
 	list := make([]map[string]interface{}, 0)
 	for _, c := range changes {
 		if c.NewValue != nil {
@@ -247,9 +258,9 @@ func (s *RethinkDB) archive(changes []r.ChangeResponse) error {
 		}
 	}
 	if len(list) > 0 {
-		_, err := r.Table(stateArchiveTableName).Insert(list).RunWrite(s.session)
+		_, err := r.Table(stateArchiveTableName).Insert(list).RunWrite(s.session, r.RunOpts{Context: ctx})
 		if err != nil {
-			return errors.Wrap(err, "error archiving records to the database")
+			return fmt.Errorf("error archiving records to the database: %w", err)
 		}
 	}
 
@@ -257,24 +268,24 @@ func (s *RethinkDB) archive(changes []r.ChangeResponse) error {
 }
 
 // Delete performes a RethinkDB KV delete operation.
-func (s *RethinkDB) Delete(req *state.DeleteRequest) error {
+func (s *RethinkDB) Delete(ctx context.Context, req *state.DeleteRequest) error {
 	if req == nil || req.Key == "" {
 		return errors.New("invalid request, missing key")
 	}
 
-	return s.BulkDelete([]state.DeleteRequest{*req})
+	return s.BulkDelete(ctx, []state.DeleteRequest{*req})
 }
 
 // BulkDelete performs a bulk delete operation.
-func (s *RethinkDB) BulkDelete(req []state.DeleteRequest) error {
+func (s *RethinkDB) BulkDelete(ctx context.Context, req []state.DeleteRequest) error {
 	list := make([]string, 0)
 	for _, d := range req {
 		list = append(list, d.Key)
 	}
 
-	c, err := r.Table(s.config.Table).GetAll(r.Args(list)).Delete().Run(s.session)
+	c, err := r.Table(s.config.Table).GetAll(r.Args(list)).Delete().Run(s.session, r.RunOpts{Context: ctx})
 	if err != nil {
-		return errors.Wrap(err, "error deleting record from the database")
+		return fmt.Errorf("error deleting record from the database: %w", err)
 	}
 	defer c.Close()
 
@@ -282,7 +293,7 @@ func (s *RethinkDB) BulkDelete(req []state.DeleteRequest) error {
 }
 
 // Multi performs multiple operations.
-func (s *RethinkDB) Multi(req state.TransactionalStateRequest) error {
+func (s *RethinkDB) Multi(ctx context.Context, req *state.TransactionalStateRequest) error {
 	upserts := make([]state.SetRequest, 0)
 	deletes := make([]state.DeleteRequest, 0)
 
@@ -291,27 +302,27 @@ func (s *RethinkDB) Multi(req state.TransactionalStateRequest) error {
 		case state.Upsert:
 			r, ok := v.Request.(state.SetRequest)
 			if !ok {
-				return errors.Errorf("invalid request type (expected SetRequest, got %t)", v.Request)
+				return fmt.Errorf("invalid request type (expected SetRequest, got %t)", v.Request)
 			}
 			upserts = append(upserts, r)
 		case state.Delete:
 			r, ok := v.Request.(state.DeleteRequest)
 			if !ok {
-				return errors.Errorf("invalid request type (expected DeleteRequest, got %t)", v.Request)
+				return fmt.Errorf("invalid request type (expected DeleteRequest, got %t)", v.Request)
 			}
 			deletes = append(deletes, r)
 		default:
-			return errors.Errorf("invalid operation type: %s", v.Operation)
+			return fmt.Errorf("invalid operation type: %s", v.Operation)
 		}
 	}
 
 	// best effort, no transacts supported
-	if err := s.BulkSet(upserts); err != nil {
-		return errors.Wrap(err, "error saving records to the database")
+	if err := s.BulkSet(ctx, upserts); err != nil {
+		return fmt.Errorf("error saving records to the database: %w", err)
 	}
 
-	if err := s.BulkDelete(deletes); err != nil {
-		return errors.Wrap(err, "error deleting records to the database")
+	if err := s.BulkDelete(ctx, deletes); err != nil {
+		return fmt.Errorf("error deleting records to the database: %w", err)
 	}
 
 	return nil
@@ -323,87 +334,17 @@ func metadataToConfig(cfg map[string]string, logger logger.Logger) (*stateConfig
 		Table: stateTableNameDefault,
 	}
 
-	// runtime
-	for k, v := range cfg {
-		switch k {
-		case "table": // string
-			c.Table = v
-		case "address": // string
-			c.Address = v
-		case "addresses": // []string
-			c.Addresses = strings.Split(v, ",")
-		case "database": // string
-			c.Database = v
-		case "username": // string
-			c.Username = v
-		case "password": // string
-			c.Password = v
-		case "authkey": // string
-			c.AuthKey = v
-		case "timeout": // time.Duration
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid timeout format: %v", v)
-			}
-			c.Timeout = d
-		case "write_timeout": // time.Duration
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid write timeout format: %v", v)
-			}
-			c.WriteTimeout = d
-		case "read_timeout": // time.Duration
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid read timeout format: %v", v)
-			}
-			c.ReadTimeout = d
-		case "keep_alive_timeout": // time.Duration
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid keep alive timeout format: %v", v)
-			}
-			c.KeepAlivePeriod = d
-		case "initial_cap": // int
-			i, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid keep initial cap format: %v", v)
-			}
-			c.InitialCap = i
-		case "max_open": // int
-			i, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid keep max open format: %v", v)
-			}
-			c.MaxOpen = i
-		case "discover_hosts": // bool
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid discover hosts format: %v", v)
-			}
-			c.DiscoverHosts = b
-		case "use-open-tracing": // bool
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid use open tracing format: %v", v)
-			}
-			c.UseOpentracing = b
-		case "archive": // bool
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid use open tracing format: %v", v)
-			}
-			c.Archive = b
-		case "max_idle": // int
-			i, err := strconv.Atoi(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "invalid keep max idle format: %v", v)
-			}
-			c.InitialCap = i
-		default:
-			logger.Infof("unrecognized metadata: %s", k)
-		}
+	err := metadata.DecodeMetadata(cfg, &c)
+	if err != nil {
+		return nil, err
 	}
 
 	return &c, nil
+}
+
+func (s *RethinkDB) GetComponentMetadata() map[string]string {
+	metadataStruct := stateConfig{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

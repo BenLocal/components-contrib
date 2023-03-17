@@ -21,6 +21,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dapr/components-contrib/state"
+	stateutils "github.com/dapr/components-contrib/state/utils"
 )
 
 type widget struct {
@@ -182,6 +183,97 @@ func TestCreateCosmosItem(t *testing.T) {
 
 		assert.Equal(t, "AQ==", m)
 	})
+
+	t.Run("create item with null data", func(t *testing.T) {
+		// Bytes are handled the same way, does not matter if is JSON or JPEG.
+		bytes, err := json.Marshal(nil)
+		assert.NoError(t, err)
+
+		req := state.SetRequest{
+			Key:   "testKey",
+			Value: bytes,
+		}
+
+		item, err := createUpsertItem("application/json", req, partitionKey)
+		assert.NoError(t, err)
+		assert.Equal(t, partitionKey, item.PartitionKey)
+		assert.Equal(t, "testKey", item.ID)
+		assert.False(t, item.IsBinary)
+		assert.Nil(t, item.TTL)
+
+		// items need to be marshallable to JSON with encoding/json
+		b, err := json.Marshal(item)
+		assert.NoError(t, err)
+
+		j := map[string]interface{}{}
+		err = json.Unmarshal(b, &j)
+		assert.NoError(t, err)
+
+		assert.Nil(t, j["value"])
+	})
+
+	t.Run("create item with empty string data and JSON content type", func(t *testing.T) {
+		// Bytes are handled the same way, does not matter if is JSON or JPEG.
+		bytes := []byte("")
+
+		req := state.SetRequest{
+			Key:   "testKey",
+			Value: bytes,
+		}
+
+		item, err := createUpsertItem("application/json", req, partitionKey)
+		assert.NoError(t, err)
+		assert.Equal(t, partitionKey, item.PartitionKey)
+		assert.Equal(t, "testKey", item.ID)
+		assert.False(t, item.IsBinary)
+		assert.Nil(t, item.TTL)
+
+		// items need to be marshallable to JSON with encoding/json
+		b, err := json.Marshal(item)
+		assert.NoError(t, err)
+
+		j := map[string]interface{}{}
+		err = json.Unmarshal(b, &j)
+		assert.NoError(t, err)
+
+		m, ok := (j["value"].(string))
+
+		assert.Truef(t, ok, "value should be a string")
+		assert.NotContains(t, j, "ttl")
+		assert.Equal(t, "", m)
+	})
+
+	t.Run("create item with empty string data and string content type", func(t *testing.T) {
+		// Bytes are handled the same way, does not matter if is JSON or JPEG.
+		bytes := []byte("")
+
+		req := state.SetRequest{
+			Key:   "testKey",
+			Value: bytes,
+		}
+
+		item, err := createUpsertItem("text/plain", req, partitionKey)
+		assert.NoError(t, err)
+		assert.Equal(t, partitionKey, item.PartitionKey)
+		assert.Equal(t, "testKey", item.ID)
+		assert.False(t, item.IsBinary)
+		assert.Nil(t, item.TTL)
+
+		// items need to be marshallable to JSON with encoding/json
+		b, err := json.Marshal(item)
+		assert.NoError(t, err)
+
+		j := map[string]interface{}{}
+		err = json.Unmarshal(b, &j)
+		assert.NoError(t, err)
+
+		m, ok := (j["value"].(string))
+
+		assert.Truef(t, ok, "value should be a string")
+		assert.NotContains(t, j, "ttl")
+
+		assert.Equal(t, "", m)
+	})
 }
 
 func TestCreateCosmosItemWithTTL(t *testing.T) {
@@ -193,7 +285,7 @@ func TestCreateCosmosItemWithTTL(t *testing.T) {
 			Key:   "testKey",
 			Value: value,
 			Metadata: map[string]string{
-				metadataTTLKey: strconv.Itoa(ttl),
+				stateutils.MetadataTTLKey: strconv.Itoa(ttl),
 			},
 		}
 
@@ -225,7 +317,7 @@ func TestCreateCosmosItemWithTTL(t *testing.T) {
 			Key:   "testKey",
 			Value: value,
 			Metadata: map[string]string{
-				metadataTTLKey: strconv.Itoa(ttl),
+				stateutils.MetadataTTLKey: strconv.Itoa(ttl),
 			},
 		}
 
@@ -256,7 +348,7 @@ func TestCreateCosmosItemWithTTL(t *testing.T) {
 			Key:   "testKey",
 			Value: value,
 			Metadata: map[string]string{
-				metadataTTLKey: "notattl",
+				stateutils.MetadataTTLKey: "notattl",
 			},
 		}
 

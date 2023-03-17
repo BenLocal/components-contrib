@@ -14,10 +14,12 @@ limitations under the License.
 package parameterstore
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	oos "github.com/alibabacloud-go/oos-20190601/client"
+	util "github.com/alibabacloud-go/tea-utils/service"
 	"github.com/alibabacloud-go/tea/tea"
 	"github.com/stretchr/testify/assert"
 
@@ -30,11 +32,9 @@ const (
 	secretValue = "oos-secret-value"
 )
 
-type mockedParameterStore struct {
-	parameterStoreClient
-}
+type mockedParameterStore struct{}
 
-func (m *mockedParameterStore) GetSecretParameter(request *oos.GetSecretParameterRequest) (*oos.GetSecretParameterResponse, error) {
+func (m *mockedParameterStore) GetSecretParameterWithOptions(request *oos.GetSecretParameterRequest, runtime *util.RuntimeOptions) (*oos.GetSecretParameterResponse, error) {
 	return &oos.GetSecretParameterResponse{
 		Body: &oos.GetSecretParameterResponseBody{
 			Parameter: &oos.GetSecretParameterResponseBodyParameter{
@@ -45,7 +45,7 @@ func (m *mockedParameterStore) GetSecretParameter(request *oos.GetSecretParamete
 	}, nil
 }
 
-func (m *mockedParameterStore) GetSecretParametersByPath(request *oos.GetSecretParametersByPathRequest) (*oos.GetSecretParametersByPathResponse, error) {
+func (m *mockedParameterStore) GetSecretParametersByPathWithOptions(request *oos.GetSecretParametersByPathRequest, runtime *util.RuntimeOptions) (*oos.GetSecretParametersByPathResponse, error) {
 	return &oos.GetSecretParametersByPathResponse{
 		Body: &oos.GetSecretParametersByPathResponseBody{
 			Parameters: []*oos.GetSecretParametersByPathResponseBodyParameters{
@@ -58,15 +58,13 @@ func (m *mockedParameterStore) GetSecretParametersByPath(request *oos.GetSecretP
 	}, nil
 }
 
-type mockedParameterStoreReturnError struct {
-	parameterStoreClient
-}
+type mockedParameterStoreReturnError struct{}
 
-func (m *mockedParameterStoreReturnError) GetSecretParameter(request *oos.GetSecretParameterRequest) (*oos.GetSecretParameterResponse, error) {
+func (m *mockedParameterStoreReturnError) GetSecretParameterWithOptions(request *oos.GetSecretParameterRequest, runtime *util.RuntimeOptions) (*oos.GetSecretParameterResponse, error) {
 	return nil, fmt.Errorf("mocked error")
 }
 
-func (m *mockedParameterStoreReturnError) GetSecretParametersByPath(request *oos.GetSecretParametersByPathRequest) (*oos.GetSecretParametersByPathResponse, error) {
+func (m *mockedParameterStoreReturnError) GetSecretParametersByPathWithOptions(request *oos.GetSecretParametersByPathRequest, runtime *util.RuntimeOptions) (*oos.GetSecretParametersByPathResponse, error) {
 	return nil, fmt.Errorf("mocked error")
 }
 
@@ -79,7 +77,7 @@ func TestInit(t *testing.T) {
 			"accessKeyId":     "a",
 			"accessKeySecret": "a",
 		}
-		err := s.Init(m)
+		err := s.Init(context.Background(), m)
 		assert.Nil(t, err)
 	})
 
@@ -88,7 +86,7 @@ func TestInit(t *testing.T) {
 			"accessKeyId":     "a",
 			"accessKeySecret": "a",
 		}
-		err := s.Init(m)
+		err := s.Init(context.Background(), m)
 		assert.NotNil(t, err)
 	})
 }
@@ -104,7 +102,7 @@ func TestGetSecret(t *testing.T) {
 				Name:     secretName,
 				Metadata: map[string]string{},
 			}
-			output, e := s.GetSecret(req)
+			output, e := s.GetSecret(context.Background(), req)
 			assert.Nil(t, e)
 			assert.Equal(t, secretValue, output.Data[req.Name])
 		})
@@ -120,7 +118,7 @@ func TestGetSecret(t *testing.T) {
 					"version_id": "1",
 				},
 			}
-			output, e := s.GetSecret(req)
+			output, e := s.GetSecret(context.Background(), req)
 			assert.Nil(t, e)
 			assert.Equal(t, secretValue, output.Data[req.Name])
 		})
@@ -138,7 +136,7 @@ func TestGetSecret(t *testing.T) {
 					"version_id": "not-number",
 				},
 			}
-			_, e := s.GetSecret(req)
+			_, e := s.GetSecret(context.Background(), req)
 			assert.NotNil(t, e)
 		})
 
@@ -151,7 +149,7 @@ func TestGetSecret(t *testing.T) {
 				Name:     secretName,
 				Metadata: map[string]string{},
 			}
-			_, e := s.GetSecret(req)
+			_, e := s.GetSecret(context.Background(), req)
 			assert.NotNil(t, e)
 		})
 	})
@@ -167,7 +165,7 @@ func TestBulkGetSecret(t *testing.T) {
 			req := secretstores.BulkGetSecretRequest{
 				Metadata: map[string]string{},
 			}
-			output, e := s.BulkGetSecret(req)
+			output, e := s.BulkGetSecret(context.Background(), req)
 			assert.Nil(t, e)
 			assert.Contains(t, output.Data, secretName)
 		})
@@ -182,7 +180,7 @@ func TestBulkGetSecret(t *testing.T) {
 					"path": "/oos/",
 				},
 			}
-			output, e := s.BulkGetSecret(req)
+			output, e := s.BulkGetSecret(context.Background(), req)
 			assert.Nil(t, e)
 			assert.Contains(t, output.Data, secretName)
 		})
@@ -197,8 +195,18 @@ func TestBulkGetSecret(t *testing.T) {
 			req := secretstores.BulkGetSecretRequest{
 				Metadata: map[string]string{},
 			}
-			_, e := s.BulkGetSecret(req)
+			_, e := s.BulkGetSecret(context.Background(), req)
 			assert.NotNil(t, e)
 		})
+	})
+}
+
+func TestGetFeatures(t *testing.T) {
+	m := secretstores.Metadata{}
+	s := NewParameterStore(logger.NewLogger("test"))
+	s.Init(context.Background(), m)
+	t.Run("no features are advertised", func(t *testing.T) {
+		f := s.Features()
+		assert.Empty(t, f)
 	})
 }

@@ -14,15 +14,15 @@ limitations under the License.
 package ratelimit
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 	"strconv"
 
-	"github.com/didip/tollbooth"
-	"github.com/valyala/fasthttp"
-	"github.com/valyala/fasthttp/fasthttpadaptor"
+	tollbooth "github.com/didip/tollbooth/v7"
+	libstring "github.com/didip/tollbooth/v7/libstring"
 
 	"github.com/dapr/components-contrib/middleware"
-	"github.com/dapr/components-contrib/middleware/http/nethttpadaptor"
 	"github.com/dapr/kit/logger"
 )
 
@@ -39,17 +39,15 @@ const (
 )
 
 // NewRateLimitMiddleware returns a new ratelimit middleware.
-func NewRateLimitMiddleware(logger logger.Logger) *Middleware {
-	return &Middleware{logger: logger}
+func NewRateLimitMiddleware(_ logger.Logger) middleware.Middleware {
+	return &Middleware{}
 }
 
 // Middleware is an ratelimit middleware.
-type Middleware struct {
-	logger logger.Logger
-}
+type Middleware struct{}
 
 // GetHandler returns the HTTP handler provided by the middleware.
-func (m *Middleware) GetHandler(metadata middleware.Metadata) (func(h fasthttp.RequestHandler) fasthttp.RequestHandler, error) {
+func (m *Middleware) GetHandler(_ context.Context, metadata middleware.Metadata) (func(next http.Handler) http.Handler, error) {
 	meta, err := m.getNativeMetadata(metadata)
 	if err != nil {
 		return nil, err
@@ -57,13 +55,32 @@ func (m *Middleware) GetHandler(metadata middleware.Metadata) (func(h fasthttp.R
 
 	limiter := tollbooth.NewLimiter(meta.MaxRequestsPerSecond, nil)
 
-	return func(h fasthttp.RequestHandler) fasthttp.RequestHandler {
-		limitHandler := tollbooth.LimitFuncHandler(limiter, nethttpadaptor.NewNetHTTPHandlerFunc(m.logger, h))
-		wrappedHandler := fasthttpadaptor.NewFastHTTPHandlerFunc(limitHandler.ServeHTTP)
+	return func(next http.Handler) http.Handler {
+		// Adapted from toolbooth.LimitHandler
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The tollbooth library requires a remote IP. If this isn't present in the request's headers, then we need to set a value for X-Forwarded-For or the rate limiter won't work
+			remoteIP := libstring.RemoteIP(limiter.GetIPLookups(), limiter.GetForwardedForIndexFromBehind(), r)
+			remoteIP = libstring.CanonicalizeIP(remoteIP)
+			if remoteIP == "" {
+				// Forcefully set a remote IP
+				r.Header.Set("X-Forwarded-For", "0.0.0.0")
+			}
 
-		return func(ctx *fasthttp.RequestCtx) {
-			wrappedHandler(ctx)
-		}
+			httpError := tollbooth.LimitByRequest(limiter, w, r)
+			if httpError != nil {
+				limiter.ExecOnLimitReached(w, r)
+				if limiter.GetOverrideDefaultResponseWriter() {
+					return
+				}
+				w.Header().Add("Content-Type", limiter.GetMessageContentType())
+				w.WriteHeader(httpError.StatusCode)
+				w.Write([]byte(httpError.Message))
+				return
+			}
+
+			// There's no rate-limit error, serve the next handler.
+			next.ServeHTTP(w, r)
+		})
 	}, nil
 }
 
@@ -71,15 +88,17 @@ func (m *Middleware) getNativeMetadata(metadata middleware.Metadata) (*rateLimit
 	var middlewareMetadata rateLimitMiddlewareMetadata
 
 	middlewareMetadata.MaxRequestsPerSecond = defaultMaxRequestsPerSecond
-	if val, ok := metadata.Properties[maxRequestsPerSecondKey]; ok {
+	if val := metadata.Properties[maxRequestsPerSecondKey]; val != "" {
 		f, err := strconv.ParseFloat(val, 64)
 		if err != nil {
-			return nil, fmt.Errorf("error parsing ratelimit middleware property %s: %+v", maxRequestsPerSecondKey, err)
+			return nil, fmt.Errorf("error parsing metadata property %s: %w", maxRequestsPerSecondKey, err)
 		}
 		if f <= 0 {
-			return nil, fmt.Errorf("ratelimit middleware property %s must be a positive value", maxRequestsPerSecondKey)
+			return nil, fmt.Errorf("metadata property %s must be a positive value", maxRequestsPerSecondKey)
 		}
 		middlewareMetadata.MaxRequestsPerSecond = f
+	} else {
+		return nil, fmt.Errorf("metadata property %s must not be empty", maxRequestsPerSecondKey)
 	}
 
 	return &middlewareMetadata, nil

@@ -17,10 +17,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
-	"os/signal"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -50,8 +51,6 @@ const (
 	// addressTTL is the duration an address has before
 	// becoming stale and being evicted.
 	addressTTL = time.Second * 60
-	// max integer value supported on this architecture.
-	maxInt = int(^uint(0) >> 1)
 )
 
 // address is used to store an ip address along with
@@ -66,7 +65,7 @@ type address struct {
 // data used to control and access said addresses.
 type addressList struct {
 	addresses []address
-	counter   int
+	counter   atomic.Uint32
 	mu        sync.RWMutex
 }
 
@@ -97,7 +96,6 @@ func (a *addressList) add(ip string) {
 	for i := range a.addresses {
 		if a.addresses[i].ip == ip {
 			a.addresses[i].expiresAt = time.Now().Add(addressTTL)
-
 			return
 		}
 	}
@@ -115,16 +113,17 @@ func (a *addressList) next() *string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if len(a.addresses) == 0 {
+	l := uint32(len(a.addresses))
+	if l == 0 {
 		return nil
 	}
 
-	if a.counter == maxInt {
-		a.counter = 0
+	if a.counter.Load() == math.MaxUint32 {
+		// This will only reset unless another goroutine has done that already
+		a.counter.CompareAndSwap(math.MaxUint32, 0)
 	}
-	index := a.counter % len(a.addresses)
-	addr := a.addresses[index]
-	a.counter++
+	counter := a.counter.Add(1) - 1
+	addr := a.addresses[counter%l]
 
 	return &addr.ip
 }
@@ -171,7 +170,9 @@ func NewSubscriber() Subscriber {
 }
 
 // NewResolver creates the instance of mDNS name resolver.
-func NewResolver(logger logger.Logger) *Resolver {
+func NewResolver(logger logger.Logger) nameresolution.Resolver {
+	runCtx, runCancel := context.WithCancel(context.Background())
+
 	r := &Resolver{
 		subs:             make(map[string]*SubscriberPool),
 		appAddressesIPv4: make(map[string]*addressList),
@@ -189,48 +190,11 @@ func NewResolver(logger logger.Logger) *Resolver {
 		// registrations channel to signal the resolver to
 		// stop serving queries for registered app ids.
 		registrations: make(map[string]chan struct{}),
-		// shutdownRefresh channel to signal to stop on-demand refreshes.
-		shutdownRefresh: make(chan struct{}, 1),
-		// shutdownRefreshPeriodic channel to signal to stop periodic refreshes.
-		shutdownRefreshPeridoic: make(chan struct{}, 1),
-		logger:                  logger,
+		// shutdown refreshers
+		runCtx:    runCtx,
+		runCancel: runCancel,
+		logger:    logger,
 	}
-
-	// refresh app addresses on demand.
-	go func() {
-		refreshCtx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		for {
-			select {
-			case appID := <-r.refreshChan:
-				if err := r.refreshApp(refreshCtx, appID); err != nil {
-					r.logger.Warnf(err.Error())
-				}
-			case <-r.shutdownRefresh:
-				r.logger.Debug("stopping on demand cache refreshes.")
-				return
-			}
-		}
-	}()
-
-	// refresh all app addresses periodically.
-	go func() {
-		refreshCtx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		for {
-			select {
-			case <-time.After(refreshInterval):
-				if err := r.refreshAllApps(refreshCtx); err != nil {
-					r.logger.Warnf(err.Error())
-				}
-			case <-r.shutdownRefreshPeridoic:
-				r.logger.Debug("stopping periodic cache refreshes.")
-				return
-			}
-		}
-	}()
 
 	return r
 }
@@ -259,48 +223,103 @@ type Resolver struct {
 	registrationMu sync.RWMutex
 	registrations  map[string]chan struct{}
 	// shutdown refreshes.
-	shutdownRefresh         chan struct{}
-	shutdownRefreshPeridoic chan struct{}
-	logger                  logger.Logger
+	runCtx         context.Context
+	runCancel      context.CancelFunc
+	serversRunning sync.WaitGroup
+	refreshRunning atomic.Bool
+	logger         logger.Logger
+}
+
+func (m *Resolver) startRefreshers() {
+	if !m.refreshRunning.CompareAndSwap(false, true) {
+		// Refreshers are already running
+		return
+	}
+
+	// refresh app addresses periodically and on demand
+	go func() {
+		defer m.refreshRunning.Store(false)
+
+		t := time.NewTicker(refreshInterval)
+		defer t.Stop()
+
+		for {
+			select {
+			// Refresh on demand
+			case appID := <-m.refreshChan:
+				go func() {
+					if err := m.refreshApp(m.runCtx, appID); err != nil {
+						m.logger.Warnf(err.Error())
+					}
+				}()
+			// Refresh periodically
+			case <-t.C:
+				go func() {
+					if err := m.refreshAllApps(m.runCtx); err != nil {
+						m.logger.Warnf(err.Error())
+					}
+				}()
+			// Stop on context canceled
+			case <-m.runCtx.Done():
+				m.logger.Debug("stopping cache refreshes")
+				return
+			}
+		}
+	}()
 }
 
 // Init registers service for mDNS.
 func (m *Resolver) Init(metadata nameresolution.Metadata) error {
-	var appID string
-	var hostAddress string
-	var ok bool
-	var instanceID string
-
 	props := metadata.Properties
 
-	if appID, ok = props[nameresolution.MDNSInstanceName]; !ok {
+	appID := props[nameresolution.AppID]
+	if appID == "" {
 		return errors.New("name is missing")
 	}
-	if hostAddress, ok = props[nameresolution.MDNSInstanceAddress]; !ok {
+
+	hostAddress := props[nameresolution.HostAddress]
+	if hostAddress == "" {
 		return errors.New("address is missing")
 	}
 
-	p, ok := props[nameresolution.MDNSInstancePort]
-	if !ok {
+	if props[nameresolution.DaprPort] == "" {
 		return errors.New("port is missing")
 	}
 
-	port, err := strconv.ParseInt(p, 10, 32)
+	port, err := strconv.Atoi(props[nameresolution.DaprPort])
 	if err != nil {
 		return errors.New("port is invalid")
 	}
 
-	if instanceID, ok = props[nameresolution.MDNSInstanceID]; !ok {
-		instanceID = ""
-	}
-
-	err = m.registerMDNS(instanceID, appID, []string{hostAddress}, int(port))
+	err = m.registerMDNS("", appID, []string{hostAddress}, port)
 	if err != nil {
 		return err
 	}
 
 	m.logger.Infof("local service entry announced: %s -> %s:%d", appID, hostAddress, port)
+
+	go m.startRefreshers()
+
 	return nil
+}
+
+func (m *Resolver) getZeroconfResolver() (resolver *zeroconf.Resolver, err error) {
+	// Try with IPv4 + IPv6 first, then IPv4-only, then IPv6-only
+	opts := []zeroconf.ClientOption{
+		zeroconf.SelectIPTraffic(zeroconf.IPv4AndIPv6),
+		zeroconf.SelectIPTraffic(zeroconf.IPv4),
+		zeroconf.SelectIPTraffic(zeroconf.IPv6),
+	}
+	for i := 0; i < len(opts); i++ {
+		resolver, err = zeroconf.NewResolver(opts[i])
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize resolver after attempting IPv4+IPv6, IPv4-only, and IPv6-only")
+	}
+	return resolver, nil
 }
 
 // Close is not formally part of the name resolution interface as proposed
@@ -311,26 +330,28 @@ func (m *Resolver) Close() error {
 	m.registrationMu.Lock()
 	defer m.registrationMu.Unlock()
 	for _, doneChan := range m.registrations {
-		doneChan <- struct{}{}
 		close(doneChan)
 	}
 	// clear the registrations map.
 	m.registrations = make(map[string]chan struct{})
 
-	// stop all refresh loops
-	m.shutdownRefresh <- struct{}{}
-	m.shutdownRefreshPeridoic <- struct{}{}
+	// stop all background operations
+	if m.runCancel != nil {
+		m.runCancel()
+	}
+
+	// Wait for all running servers
+	m.serversRunning.Wait()
 
 	return nil
 }
 
 func (m *Resolver) registerMDNS(instanceID string, appID string, ips []string, port int) error {
-	started := make(chan bool, 1)
-	var err error
+	started := make(chan error)
 
 	// Register the app id with the resolver.
 	done := make(chan struct{}, 1)
-	key := fmt.Sprintf("%s:%d", appID, port) // WARN: we do not support unique ips.
+	key := appID + ":" + strconv.Itoa(port) // WARN: we do not support unique ips.
 
 	// NOTE: The registrations map is used to track all registered
 	// app ids. The Dapr runtime currently only registers 1 app ID
@@ -344,15 +365,20 @@ func (m *Resolver) registerMDNS(instanceID string, appID string, ips []string, p
 	m.registrations[key] = done
 	m.registrationMu.Unlock()
 
+	m.serversRunning.Add(1)
 	go func() {
-		var server *zeroconf.Server
+		var (
+			server *zeroconf.Server
+			err    error
+		)
+		defer m.serversRunning.Done()
 
 		host, _ := os.Hostname()
 		info := []string{appID}
 
 		// default instance id is unique to the process.
 		if instanceID == "" {
-			instanceID = fmt.Sprintf("%s-%d", host, syscall.Getpid())
+			instanceID = host + ":" + strconv.Itoa(syscall.Getpid())
 		}
 
 		if len(ips) > 0 {
@@ -362,31 +388,27 @@ func (m *Resolver) registerMDNS(instanceID string, appID string, ips []string, p
 		}
 
 		if err != nil {
-			started <- false
 			m.logger.Errorf("error from zeroconf register: %s", err)
-
+			started <- err
+			close(started)
 			return
 		}
-		started <- true
+		close(started)
 
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-
-		// wait until either a SIGTERM or done is received.
+		// wait until either context is canceled (when the component is shut down) or done is received.
 		select {
-		case <-sig:
-			m.logger.Debugf("received SIGTERM signal, shutting down...")
+		case <-m.runCtx.Done():
+			m.logger.Debugf("context canceled, shutting down…")
 		case <-done:
-			m.logger.Debugf("received done signal , shutting down...")
+			m.logger.Debugf("received done signal, shutting down…")
 		}
 
 		m.logger.Info("stopping mDNS server for app id: ", appID)
 		server.Shutdown()
 	}()
 
-	<-started
-
-	return err
+	// Could return an error
+	return <-started
 }
 
 // ResolveID resolves name to address via mDNS.
@@ -649,7 +671,6 @@ func (m *Resolver) refreshAllApps(ctx context.Context) error {
 	numApps := numAppIPv4Addr + numAppIPv6Addr
 	if numApps == 0 {
 		m.logger.Debug("no mDNS apps to refresh.")
-
 		return nil
 	}
 
@@ -677,17 +698,12 @@ func (m *Resolver) refreshAllApps(ctx context.Context) error {
 
 // browse will perform a non-blocking mdns network browse for the provided app id.
 func (m *Resolver) browse(ctx context.Context, appID string, onEach func(ip string)) error {
-	resolver, err := zeroconf.NewResolver(nil)
-	if err != nil {
-		return fmt.Errorf("failed to initialize resolver: %w", err)
-	}
 	entries := make(chan *zeroconf.ServiceEntry)
 
 	handleEntry := func(entry *zeroconf.ServiceEntry) {
 		for _, text := range entry.Text {
 			if text != appID {
 				m.logger.Debugf("mDNS response doesn't match app id %s, skipping.", appID)
-
 				break
 			}
 
@@ -698,7 +714,6 @@ func (m *Resolver) browse(ctx context.Context, appID string, onEach func(ip stri
 
 			if !hasIPv4Address && !hasIPv6Address {
 				m.logger.Debugf("mDNS response for app id %s doesn't contain any IPv4 or IPv6 addresses, skipping.", appID)
-
 				break
 			}
 
@@ -709,11 +724,11 @@ func (m *Resolver) browse(ctx context.Context, appID string, onEach func(ip stri
 			// We should understand the cases in which additional addresses
 			// are returned and whether we need to support them.
 			if hasIPv4Address {
-				addr = fmt.Sprintf("%s:%d", entry.AddrIPv4[0].String(), port)
+				addr = entry.AddrIPv4[0].String() + ":" + strconv.Itoa(port)
 				m.addAppAddressIPv4(appID, addr)
 			}
 			if hasIPv6Address {
-				addr = fmt.Sprintf("%s:%d", entry.AddrIPv6[0].String(), port)
+				addr = entry.AddrIPv6[0].String() + ":" + strconv.Itoa(port)
 				m.addAppAddressIPv6(appID, addr)
 			}
 
@@ -749,11 +764,11 @@ func (m *Resolver) browse(ctx context.Context, appID string, onEach func(ip stri
 		}
 	}(entries)
 
-	if err = resolver.Browse(ctx, appID, "local.", entries); err != nil {
-		return fmt.Errorf("failed to browse: %w", err)
+	resolver, err := m.getZeroconfResolver()
+	if err != nil {
+		return err
 	}
-
-	return nil
+	return resolver.Browse(ctx, appID, "local.", entries)
 }
 
 // addAppAddressIPv4 adds an IPv4 address to the
@@ -834,7 +849,6 @@ func (m *Resolver) nextIPv4Address(appID string) *string {
 		addr := addrList.next()
 		if addr != nil {
 			m.logger.Debugf("found mDNS IPv4 address in cache: %s", *addr)
-
 			return addr
 		}
 	}
@@ -852,7 +866,6 @@ func (m *Resolver) nextIPv6Address(appID string) *string {
 		addr := addrList.next()
 		if addr != nil {
 			m.logger.Debugf("found mDNS IPv6 address in cache: %s", *addr)
-
 			return addr
 		}
 	}
@@ -862,16 +875,18 @@ func (m *Resolver) nextIPv6Address(appID string) *string {
 
 // union merges the elements from two lists into a set.
 func union(first []string, second []string) []string {
-	keys := make(map[string]struct{})
+	keys := make(map[string]struct{}, len(first)+len(second))
 	for _, id := range first {
 		keys[id] = struct{}{}
 	}
 	for _, id := range second {
 		keys[id] = struct{}{}
 	}
-	result := make([]string, 0, len(keys))
+	result := make([]string, len(keys))
+	i := 0
 	for id := range keys {
-		result = append(result, id)
+		result[i] = id
+		i++
 	}
 
 	return result

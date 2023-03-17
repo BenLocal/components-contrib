@@ -15,7 +15,7 @@ package webhook
 
 import (
 	"context"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -26,6 +26,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -36,48 +37,48 @@ func TestPublishMsg(t *testing.T) { //nolint:paralleltest
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write([]byte("{\"errcode\":0}"))
 		require.NoError(t, err)
-		if r.Method != "POST" {
+		if r.Method != http.MethodPost {
 			t.Errorf("Expected 'POST' request, got '%s'", r.Method)
 		}
 		if r.URL.EscapedPath() != "/test" {
 			t.Errorf("Expected request to '/test', got '%s'", r.URL.EscapedPath())
 		}
 
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		require.Nil(t, err)
 		assert.Equal(t, msg, string(body))
 	}))
 	defer ts.Close()
 
-	m := bindings.Metadata{Name: "test", Properties: map[string]string{
+	m := bindings.Metadata{Base: metadata.Base{Name: "test", Properties: map[string]string{
 		"url":    ts.URL + "/test",
 		"secret": "",
 		"id":     "x",
-	}}
+	}}}
 
 	d := NewDingTalkWebhook(logger.NewLogger("test"))
-	err := d.Init(m)
+	err := d.Init(context.Background(), m)
 	require.NoError(t, err)
 
 	req := &bindings.InvokeRequest{Data: []byte(msg), Operation: bindings.CreateOperation, Metadata: map[string]string{}}
-	_, err = d.Invoke(context.TODO(), req)
+	_, err = d.Invoke(context.Background(), req)
 	require.NoError(t, err)
 }
 
 func TestBindingReadAndInvoke(t *testing.T) { //nolint:paralleltest
 	msg := "{\"type\": \"text\",\"text\": {\"content\": \"hello\"}}"
 
-	m := bindings.Metadata{
+	m := bindings.Metadata{Base: metadata.Base{
 		Name: "test",
 		Properties: map[string]string{
 			"url":    "/test",
 			"secret": "",
 			"id":     "x",
 		},
-	}
+	}}
 
 	d := NewDingTalkWebhook(logger.NewLogger("test"))
-	err := d.Init(m)
+	err := d.Init(context.Background(), m)
 	assert.NoError(t, err)
 
 	var count int32
@@ -91,11 +92,11 @@ func TestBindingReadAndInvoke(t *testing.T) { //nolint:paralleltest
 		return nil, nil
 	}
 
-	err = d.Read(handler)
+	err = d.Read(context.Background(), handler)
 	require.NoError(t, err)
 
 	req := &bindings.InvokeRequest{Data: []byte(msg), Operation: bindings.GetOperation, Metadata: map[string]string{}}
-	_, err = d.Invoke(context.TODO(), req)
+	_, err = d.Invoke(context.Background(), req)
 	require.NoError(t, err)
 
 	select {
@@ -104,4 +105,19 @@ func TestBindingReadAndInvoke(t *testing.T) { //nolint:paralleltest
 	case <-time.After(time.Second):
 		require.FailNow(t, "read timeout")
 	}
+}
+
+func TestBindingClose(t *testing.T) {
+	d := NewDingTalkWebhook(logger.NewLogger("test"))
+	m := bindings.Metadata{Base: metadata.Base{
+		Name: "test",
+		Properties: map[string]string{
+			"url":    "/test",
+			"secret": "",
+			"id":     "x",
+		},
+	}}
+	assert.NoError(t, d.Init(context.Background(), m))
+	assert.NoError(t, d.Close())
+	assert.NoError(t, d.Close(), "second close should not error")
 }

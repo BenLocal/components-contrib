@@ -15,25 +15,25 @@ package kinesis
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/service/kinesis"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/google/uuid"
 	"github.com/vmware/vmware-go-kcl/clientlibrary/config"
 	"github.com/vmware/vmware-go-kcl/clientlibrary/interfaces"
 	"github.com/vmware/vmware-go-kcl/clientlibrary/worker"
 
-	aws_auth "github.com/dapr/components-contrib/authentication/aws"
 	"github.com/dapr/components-contrib/bindings"
+	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -48,49 +48,56 @@ type AWSKinesis struct {
 	streamARN   *string
 	consumerARN *string
 	logger      logger.Logger
+
+	closed  atomic.Bool
+	closeCh chan struct{}
+	wg      sync.WaitGroup
 }
 
 type kinesisMetadata struct {
-	StreamName          string              `json:"streamName"`
-	ConsumerName        string              `json:"consumerName"`
-	Region              string              `json:"region"`
-	Endpoint            string              `json:"endpoint"`
-	AccessKey           string              `json:"accessKey"`
-	SecretKey           string              `json:"secretKey"`
-	SessionToken        string              `json:"sessionToken"`
-	KinesisConsumerMode kinesisConsumerMode `json:"mode"`
+	StreamName          string `json:"streamName"`
+	ConsumerName        string `json:"consumerName"`
+	Region              string `json:"region"`
+	Endpoint            string `json:"endpoint"`
+	AccessKey           string `json:"accessKey"`
+	SecretKey           string `json:"secretKey"`
+	SessionToken        string `json:"sessionToken"`
+	KinesisConsumerMode string `json:"mode" mapstructure:"mode"`
 }
-
-type kinesisConsumerMode string
 
 const (
 	// ExtendedFanout - dedicated throughput through data stream api.
-	ExtendedFanout kinesisConsumerMode = "extended"
+	ExtendedFanout = "extended"
 
 	// SharedThroughput - shared throughput using checkpoint and monitoring.
-	SharedThroughput kinesisConsumerMode = "shared"
+	SharedThroughput = "shared"
 
 	partitionKeyName = "partitionKey"
 )
 
 // recordProcessorFactory.
 type recordProcessorFactory struct {
+	ctx     context.Context
 	logger  logger.Logger
 	handler bindings.Handler
 }
 
 type recordProcessor struct {
+	ctx     context.Context
 	logger  logger.Logger
 	handler bindings.Handler
 }
 
 // NewAWSKinesis returns a new AWS Kinesis instance.
-func NewAWSKinesis(logger logger.Logger) *AWSKinesis {
-	return &AWSKinesis{logger: logger}
+func NewAWSKinesis(logger logger.Logger) bindings.InputOutputBinding {
+	return &AWSKinesis{
+		logger:  logger,
+		closeCh: make(chan struct{}),
+	}
 }
 
 // Init does metadata parsing and connection creation.
-func (a *AWSKinesis) Init(metadata bindings.Metadata) error {
+func (a *AWSKinesis) Init(ctx context.Context, metadata bindings.Metadata) error {
 	m, err := a.parseMetadata(metadata)
 	if err != nil {
 		return err
@@ -110,7 +117,7 @@ func (a *AWSKinesis) Init(metadata bindings.Metadata) error {
 	}
 
 	streamName := aws.String(m.StreamName)
-	stream, err := client.DescribeStream(&kinesis.DescribeStreamInput{
+	stream, err := client.DescribeStreamWithContext(ctx, &kinesis.DescribeStreamInput{
 		StreamName: streamName,
 	})
 	if err != nil {
@@ -140,7 +147,7 @@ func (a *AWSKinesis) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*
 	if partitionKey == "" {
 		partitionKey = uuid.New().String()
 	}
-	_, err := a.client.PutRecord(&kinesis.PutRecordInput{
+	_, err := a.client.PutRecordWithContext(ctx, &kinesis.PutRecordInput{
 		StreamName:   &a.metadata.StreamName,
 		Data:         req.Data,
 		PartitionKey: &partitionKey,
@@ -149,63 +156,96 @@ func (a *AWSKinesis) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*
 	return nil, err
 }
 
-func (a *AWSKinesis) Read(handler bindings.Handler) error {
+func (a *AWSKinesis) Read(ctx context.Context, handler bindings.Handler) (err error) {
+	if a.closed.Load() {
+		return errors.New("binding is closed")
+	}
+
 	if a.metadata.KinesisConsumerMode == SharedThroughput {
-		a.worker = worker.NewWorker(a.recordProcessorFactory(handler), a.workerConfig)
-		err := a.worker.Start()
+		a.worker = worker.NewWorker(a.recordProcessorFactory(ctx, handler), a.workerConfig)
+		err = a.worker.Start()
 		if err != nil {
 			return err
 		}
 	} else if a.metadata.KinesisConsumerMode == ExtendedFanout {
-		ctx := context.Background()
-		stream, err := a.client.DescribeStream(&kinesis.DescribeStreamInput{StreamName: &a.metadata.StreamName})
+		var stream *kinesis.DescribeStreamOutput
+		stream, err = a.client.DescribeStream(&kinesis.DescribeStreamInput{StreamName: &a.metadata.StreamName})
 		if err != nil {
 			return err
 		}
-		go a.Subscribe(ctx, *stream.StreamDescription, handler)
+		err = a.Subscribe(ctx, *stream.StreamDescription, handler)
+		if err != nil {
+			return err
+		}
 	}
 
-	exitChan := make(chan os.Signal, 1)
-	signal.Notify(exitChan, os.Interrupt, syscall.SIGTERM)
-	<-exitChan
-
-	if a.metadata.KinesisConsumerMode == SharedThroughput {
-		go a.worker.Shutdown()
-	} else if a.metadata.KinesisConsumerMode == ExtendedFanout {
-		go a.deregisterConsumer(a.streamARN, a.consumerARN)
-	}
+	// Wait for context cancelation then stop
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		select {
+		case <-ctx.Done():
+		case <-a.closeCh:
+		}
+		if a.metadata.KinesisConsumerMode == SharedThroughput {
+			a.worker.Shutdown()
+		} else if a.metadata.KinesisConsumerMode == ExtendedFanout {
+			a.deregisterConsumer(a.streamARN, a.consumerARN)
+		}
+	}()
 
 	return nil
 }
 
 // Subscribe to all shards.
 func (a *AWSKinesis) Subscribe(ctx context.Context, streamDesc kinesis.StreamDescription, handler bindings.Handler) error {
-	consumerARN, err := a.ensureConsumer(streamDesc.StreamARN)
+	consumerARN, err := a.ensureConsumer(ctx, streamDesc.StreamARN)
 	if err != nil {
 		a.logger.Error(err)
-
 		return err
 	}
 
 	a.consumerARN = consumerARN
 
-	for {
-		var wg sync.WaitGroup
-		wg.Add(len(streamDesc.Shards))
-		for i, shard := range streamDesc.Shards {
-			go func(idx int, s *kinesis.Shard) error {
-				defer wg.Done()
+	a.wg.Add(len(streamDesc.Shards))
+	for i, shard := range streamDesc.Shards {
+		go func(idx int, s *kinesis.Shard) {
+			defer a.wg.Done()
+
+			// Reconnection backoff
+			bo := backoff.NewExponentialBackOff()
+			bo.InitialInterval = 2 * time.Second
+
+			// Repeat until context is canceled or binding closed.
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-a.closeCh:
+					return
+				default:
+				}
+
 				sub, err := a.client.SubscribeToShardWithContext(ctx, &kinesis.SubscribeToShardInput{
 					ConsumerARN:      consumerARN,
 					ShardId:          s.ShardId,
 					StartingPosition: &kinesis.StartingPosition{Type: aws.String(kinesis.ShardIteratorTypeLatest)},
 				})
 				if err != nil {
-					a.logger.Error(err)
-
-					return err
+					wait := bo.NextBackOff()
+					a.logger.Errorf("Error while reading from shard %v: %v. Attempting to reconnect in %s...", s.ShardId, err, wait)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(wait):
+						continue
+					}
 				}
 
+				// Reset the backoff on connection success
+				bo.Reset()
+
+				// Process events
 				for event := range sub.EventStream.Events() {
 					switch e := event.(type) {
 					case *kinesis.SubscribeToShardEvent:
@@ -216,31 +256,38 @@ func (a *AWSKinesis) Subscribe(ctx context.Context, streamDesc kinesis.StreamDes
 						}
 					}
 				}
-
-				return nil
-			}(i, shard)
-		}
-		wg.Wait()
-		time.Sleep(time.Minute * 5)
+			}
+		}(i, shard)
 	}
+
+	return nil
 }
 
-func (a *AWSKinesis) ensureConsumer(streamARN *string) (*string, error) {
-	consumer, err := a.client.DescribeStreamConsumer(&kinesis.DescribeStreamConsumerInput{
+func (a *AWSKinesis) Close() error {
+	if a.closed.CompareAndSwap(false, true) {
+		close(a.closeCh)
+	}
+	a.wg.Wait()
+	return nil
+}
+
+func (a *AWSKinesis) ensureConsumer(ctx context.Context, streamARN *string) (*string, error) {
+	// Only set timeout on consumer call.
+	conCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	consumer, err := a.client.DescribeStreamConsumerWithContext(conCtx, &kinesis.DescribeStreamConsumerInput{
 		ConsumerName: &a.metadata.ConsumerName,
 		StreamARN:    streamARN,
 	})
 	if err != nil {
-		arn, err := a.registerConsumer(streamARN)
-
-		return arn, err
+		return a.registerConsumer(ctx, streamARN)
 	}
 
 	return consumer.ConsumerDescription.ConsumerARN, nil
 }
 
-func (a *AWSKinesis) registerConsumer(streamARN *string) (*string, error) {
-	consumer, err := a.client.RegisterStreamConsumer(&kinesis.RegisterStreamConsumerInput{
+func (a *AWSKinesis) registerConsumer(ctx context.Context, streamARN *string) (*string, error) {
+	consumer, err := a.client.RegisterStreamConsumerWithContext(ctx, &kinesis.RegisterStreamConsumerInput{
 		ConsumerName: &a.metadata.ConsumerName,
 		StreamARN:    streamARN,
 	})
@@ -248,7 +295,7 @@ func (a *AWSKinesis) registerConsumer(streamARN *string) (*string, error) {
 		return nil, err
 	}
 
-	err = a.waitUntilConsumerExists(context.Background(), &kinesis.DescribeStreamConsumerInput{
+	err = a.waitUntilConsumerExists(ctx, &kinesis.DescribeStreamConsumerInput{
 		ConsumerName: &a.metadata.ConsumerName,
 		StreamARN:    streamARN,
 	})
@@ -262,11 +309,14 @@ func (a *AWSKinesis) registerConsumer(streamARN *string) (*string, error) {
 
 func (a *AWSKinesis) deregisterConsumer(streamARN *string, consumerARN *string) error {
 	if a.consumerARN != nil {
-		_, err := a.client.DeregisterStreamConsumer(&kinesis.DeregisterStreamConsumerInput{
+		// Use a background context because the running context may have been canceled already
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		_, err := a.client.DeregisterStreamConsumerWithContext(ctx, &kinesis.DeregisterStreamConsumerInput{
 			ConsumerARN:  consumerARN,
 			StreamARN:    streamARN,
 			ConsumerName: &a.metadata.ConsumerName,
 		})
+		cancel()
 
 		return err
 	}
@@ -305,7 +355,7 @@ func (a *AWSKinesis) waitUntilConsumerExists(ctx aws.Context, input *kinesis.Des
 }
 
 func (a *AWSKinesis) getClient(metadata *kinesisMetadata) (*kinesis.Kinesis, error) {
-	sess, err := aws_auth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
+	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -314,27 +364,29 @@ func (a *AWSKinesis) getClient(metadata *kinesisMetadata) (*kinesis.Kinesis, err
 	return k, nil
 }
 
-func (a *AWSKinesis) parseMetadata(metadata bindings.Metadata) (*kinesisMetadata, error) {
-	b, err := json.Marshal(metadata.Properties)
-	if err != nil {
-		return nil, err
-	}
-
+func (a *AWSKinesis) parseMetadata(meta bindings.Metadata) (*kinesisMetadata, error) {
 	var m kinesisMetadata
-	err = json.Unmarshal(b, &m)
+	err := metadata.DecodeMetadata(meta.Properties, &m)
 	if err != nil {
 		return nil, err
 	}
-
 	return &m, nil
 }
 
-func (a *AWSKinesis) recordProcessorFactory(handler bindings.Handler) interfaces.IRecordProcessorFactory {
-	return &recordProcessorFactory{logger: a.logger, handler: handler}
+func (a *AWSKinesis) recordProcessorFactory(ctx context.Context, handler bindings.Handler) interfaces.IRecordProcessorFactory {
+	return &recordProcessorFactory{
+		ctx:     ctx,
+		logger:  a.logger,
+		handler: handler,
+	}
 }
 
 func (r *recordProcessorFactory) CreateProcessor() interfaces.IRecordProcessor {
-	return &recordProcessor{logger: r.logger, handler: r.handler}
+	return &recordProcessor{
+		ctx:     r.ctx,
+		logger:  r.logger,
+		handler: r.handler,
+	}
 }
 
 func (p *recordProcessor) Initialize(input *interfaces.InitializationInput) {
@@ -348,7 +400,7 @@ func (p *recordProcessor) ProcessRecords(input *interfaces.ProcessRecordsInput) 
 	}
 
 	for _, v := range input.Records {
-		p.handler(context.TODO(), &bindings.ReadResponse{
+		p.handler(p.ctx, &bindings.ReadResponse{
 			Data: v.Data,
 		})
 	}

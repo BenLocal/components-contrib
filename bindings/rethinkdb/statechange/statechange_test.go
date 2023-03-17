@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -41,7 +42,7 @@ func getNewRethinkActorBinding() *Binding {
 		l.SetOutputLevel(logger.DebugLevel)
 	}
 
-	return NewRethinkDBStateChangeBinding(l)
+	return NewRethinkDBStateChangeBinding(l).(*Binding)
 }
 
 /*
@@ -63,30 +64,28 @@ func TestBinding(t *testing.T) {
 		testDuration = d
 	}
 
-	m := bindings.Metadata{
+	m := bindings.Metadata{Base: metadata.Base{
 		Name:       "test",
 		Properties: getTestMetadata(),
-	}
+	}}
 	assert.NotNil(t, m.Properties)
 
 	b := getNewRethinkActorBinding()
-	err := b.Init(m)
+	err := b.Init(context.Background(), m)
 	assert.NoErrorf(t, err, "error initializing")
 
-	go func() {
-		err = b.Read(func(ctx context.Context, res *bindings.ReadResponse) ([]byte, error) {
-			assert.NotNil(t, res)
-			t.Logf("state change event:\n%s", string(res.Data))
+	ctx, cancel := context.WithCancel(context.Background())
+	err = b.Read(ctx, func(_ context.Context, res *bindings.ReadResponse) ([]byte, error) {
+		assert.NotNil(t, res)
+		t.Logf("state change event:\n%s", string(res.Data))
 
-			return nil, nil
-		})
-		assert.NoErrorf(t, err, "error on read")
-	}()
+		return nil, nil
+	})
+	assert.NoErrorf(t, err, "error on read")
 
 	testTimer := time.AfterFunc(testDuration, func() {
 		t.Log("done")
-		b.stopCh <- true
+		cancel()
 	})
 	defer testTimer.Stop()
-	<-b.stopCh
 }

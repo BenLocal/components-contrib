@@ -17,15 +17,19 @@ limitations under the License.
 package eventhubs
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -56,12 +60,14 @@ const (
 
 func createIotHubBindingsMetadata() bindings.Metadata {
 	metadata := bindings.Metadata{
-		Properties: map[string]string{
-			connectionString:     os.Getenv(iotHubConnectionStringEnvKey),
-			consumerGroup:        os.Getenv(iotHubConsumerGroupEnvKey),
-			storageAccountName:   os.Getenv(storageAccountNameEnvKey),
-			storageAccountKey:    os.Getenv(storageAccountKeyEnvKey),
-			storageContainerName: testStorageContainerName,
+		Base: metadata.Base{
+			Properties: map[string]string{
+				"connectionString":     os.Getenv(iotHubConnectionStringEnvKey),
+				"consumerGroup":        os.Getenv(iotHubConsumerGroupEnvKey),
+				"storageAccountName":   os.Getenv(storageAccountNameEnvKey),
+				"storageAccountKey":    os.Getenv(storageAccountKeyEnvKey),
+				"storageContainerName": testStorageContainerName,
+			},
 		},
 	}
 
@@ -70,15 +76,17 @@ func createIotHubBindingsMetadata() bindings.Metadata {
 
 func createEventHubsBindingsAADMetadata() bindings.Metadata {
 	metadata := bindings.Metadata{
-		Properties: map[string]string{
-			consumerGroup:        os.Getenv(eventHubsBindingsConsumerGroupEnvKey),
-			storageAccountName:   os.Getenv(azureBlobStorageAccountEnvKey),
-			storageContainerName: os.Getenv(eventHubsBindingsContainerEnvKey),
-			"eventHub":           os.Getenv(eventHubBindingsHubEnvKey),
-			"eventHubNamespace":  os.Getenv(eventHubBindingsNamespaceEnvKey),
-			"azureTenantId":      os.Getenv(azureTenantIdEnvKey),
-			"azureClientId":      os.Getenv(azureServicePrincipalClientIdEnvKey),
-			"azureClientSecret":  os.Getenv(azureServicePrincipalClientSecretEnvKey),
+		Base: metadata.Base{
+			Properties: map[string]string{
+				"consumerGroup":        os.Getenv(eventHubsBindingsConsumerGroupEnvKey),
+				"storageAccountName":   os.Getenv(azureBlobStorageAccountEnvKey),
+				"storageContainerName": os.Getenv(eventHubsBindingsContainerEnvKey),
+				"eventHub":             os.Getenv(eventHubBindingsHubEnvKey),
+				"eventHubNamespace":    os.Getenv(eventHubBindingsNamespaceEnvKey),
+				"azureTenantId":        os.Getenv(azureTenantIdEnvKey),
+				"azureClientId":        os.Getenv(azureServicePrincipalClientIdEnvKey),
+				"azureClientSecret":    os.Getenv(azureServicePrincipalClientSecretEnvKey),
+			},
 		},
 	}
 
@@ -86,35 +94,39 @@ func createEventHubsBindingsAADMetadata() bindings.Metadata {
 }
 
 func testEventHubsBindingsAADAuthentication(t *testing.T) {
-	logger := logger.NewLogger("bindings.azure.eventhubs.integration.test")
-	metadata := createEventHubsBindingsAADMetadata()
-	eventHubsBindings := NewAzureEventHubs(logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	err := eventHubsBindings.Init(metadata)
-	assert.NoError(t, err)
+	log := logger.NewLogger("bindings.azure.eventhubs.integration.test")
+	log.SetOutputLevel(logger.DebugLevel)
+	metadata := createEventHubsBindingsAADMetadata()
+	eventHubsBindings := NewAzureEventHubs(log)
+
+	err := eventHubsBindings.Init(context.Background(), metadata)
+	require.NoError(t, err)
 
 	req := &bindings.InvokeRequest{
 		Data: []byte("Integration test message"),
 	}
-	_, err = eventHubsBindings.Invoke(req)
-	assert.NoError(t, err)
+	_, err = eventHubsBindings.Invoke(ctx, req)
+	require.NoError(t, err)
 
 	// Setup Read binding to capture readResponses in a closure so that test asserts can be
 	// performed on the main thread, including the case where the handler is never invoked.
 	var readResponses []bindings.ReadResponse
-	handler := func(data *bindings.ReadResponse) ([]byte, error) {
+	var handler bindings.Handler = func(_ context.Context, data *bindings.ReadResponse) ([]byte, error) {
 		readResponses = append(readResponses, *data)
 		return nil, nil
 	}
 
-	_, err = eventHubsBindings.Invoke(req)
-	assert.NoError(t, err)
+	_, err = eventHubsBindings.Invoke(ctx, req)
+	require.NoError(t, err)
 
-	go eventHubsBindings.Read(handler)
+	eventHubsBindings.Read(ctx, handler)
 
 	time.Sleep(1 * time.Second)
-	_, err = eventHubsBindings.Invoke(req)
-	assert.NoError(t, err)
+	_, err = eventHubsBindings.Invoke(ctx, req)
+	require.NoError(t, err)
 
 	// Note: azure-event-hubs-go SDK defaultLeasePersistenceInterval is 5s
 	// Sleep long enough so that the azure event hubs SDK has time to persist updated checkpoints
@@ -122,35 +134,37 @@ func testEventHubsBindingsAADAuthentication(t *testing.T) {
 	time.Sleep(10 * time.Second)
 
 	assert.Greater(t, len(readResponses), 0, "Failed to receive any EventHub events")
-	logger.Infof("Received %d messages", len(readResponses))
+	log.Infof("Received %d messages", len(readResponses))
 	for _, r := range readResponses {
-		logger.Infof("Message metadata: %v", r.Metadata)
+		log.Infof("Message metadata: %v", r.Metadata)
 		assert.Contains(t, string(r.Data), "Integration test message")
 	}
 }
 
 func testReadIotHubEvents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	logger := logger.NewLogger("bindings.azure.eventhubs.integration.test")
 	eh := NewAzureEventHubs(logger)
-	err := eh.Init(createIotHubBindingsMetadata())
-	assert.Nil(t, err)
+	err := eh.Init(context.Background(), createIotHubBindingsMetadata())
+	require.NoError(t, err)
 
 	// Invoke az CLI via bash script to send test IoT device events
 	// Requires the AZURE_CREDENTIALS environment variable to be already set (output of `az ad sp create-for-rbac`)
 	cmd := exec.Command("/bin/bash", "../../../tests/scripts/send-iot-device-events.sh")
 	cmd.Env = append(os.Environ(), fmt.Sprintf("IOT_HUB_NAME=%s", os.Getenv(iotHubNameEnvKey)))
 	out, err := cmd.CombinedOutput()
-	assert.Nil(t, err, "Error in send-iot-device-events.sh:\n%s", out)
+	assert.NoError(t, err, "Error in send-iot-device-events.sh:\n%s", out)
 
 	// Setup Read binding to capture readResponses in a closure so that test asserts can be
 	// performed on the main thread, including the case where the handler is never invoked.
 	var readResponses []bindings.ReadResponse
-	handler := func(data *bindings.ReadResponse) ([]byte, error) {
+	handler := func(_ context.Context, data *bindings.ReadResponse) ([]byte, error) {
 		readResponses = append(readResponses, *data)
 		return nil, nil
 	}
 
-	go eh.Read(handler)
+	eh.Read(ctx, handler)
 
 	// Note: azure-event-hubs-go SDK defaultLeasePersistenceInterval is 5s
 	// Sleep long enough so that the azure event hubs SDK has time to persist updated checkpoints
@@ -165,17 +179,20 @@ func testReadIotHubEvents(t *testing.T) {
 
 		// Verify expected IoT Hub device event metadata exists
 		// TODO: add device messages than can populate the sysPropPartitionKey and sysPropIotHubConnectionModuleID metadata
-		assert.Contains(t, r.Metadata, sysPropSequenceNumber, "IoT device event missing: %s", sysPropSequenceNumber)
-		assert.Contains(t, r.Metadata, sysPropEnqueuedTime, "IoT device event missing: %s", sysPropEnqueuedTime)
-		assert.Contains(t, r.Metadata, sysPropOffset, "IoT device event missing: %s", sysPropOffset)
-		assert.Contains(t, r.Metadata, sysPropIotHubDeviceConnectionID, "IoT device event missing: %s", sysPropIotHubDeviceConnectionID)
-		assert.Contains(t, r.Metadata, sysPropIotHubAuthGenerationID, "IoT device event missing: %s", sysPropIotHubAuthGenerationID)
-		assert.Contains(t, r.Metadata, sysPropIotHubConnectionAuthMethod, "IoT device event missing: %s", sysPropIotHubConnectionAuthMethod)
-		assert.Contains(t, r.Metadata, sysPropIotHubEnqueuedTime, "IoT device event missing: %s", sysPropIotHubEnqueuedTime)
-		assert.Contains(t, r.Metadata, sysPropMessageID, "IoT device event missing: %s", sysPropMessageID)
+		assert.Contains(t, r.Metadata, "x-opt-sequence-number", "IoT device event missing: x-opt-sequence-number")
+		assert.Contains(t, r.Metadata, "x-opt-enqueued-time", "IoT device event missing: x-opt-enqueued-time")
+		assert.Contains(t, r.Metadata, "x-opt-offset", "IoT device event missing: x-opt-offset")
+		assert.Contains(t, r.Metadata, "iothub-connection-device-id", "IoT device event missing: iothub-connection-device-id")
+		assert.Contains(t, r.Metadata, "iothub-connection-auth-generation-id", "IoT device event missing: iothub-connection-auth-generation-id")
+		assert.Contains(t, r.Metadata, "iothub-connection-auth-method", "IoT device event missing: iothub-connection-auth-method")
+		assert.Contains(t, r.Metadata, "iothub-enqueuedtime", "IoT device event missing: iothub-enqueuedtime")
+		assert.Contains(t, r.Metadata, "message-id", "IoT device event missing: message-id")
 	}
 
-	eh.Close()
+	cancel()
+	if c, ok := eh.(io.Closer); ok {
+		c.Close()
+	}
 }
 
 func TestIntegrationCases(t *testing.T) {

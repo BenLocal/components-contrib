@@ -18,6 +18,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
+
+	mdata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 )
 
@@ -30,7 +33,7 @@ func TestParseMetadata(t *testing.T) {
 	}{
 		{
 			desc: "Valid Metadata",
-			input: pubsub.Metadata{
+			input: pubsub.Metadata{Base: mdata.Base{
 				Properties: map[string]string{
 					"natsURL":        "nats://localhost:4222",
 					"name":           "myName",
@@ -38,10 +41,18 @@ func TestParseMetadata(t *testing.T) {
 					"queueGroupName": "myQueue",
 					"startSequence":  "1",
 					"startTime":      "1629328511",
-					"deliverAll":     "true",
 					"flowControl":    "true",
+					"ackWait":        "2s",
+					"maxDeliver":     "10",
+					"backOff":        "500ms, 2s, 10s",
+					"maxAckPending":  "5000",
+					"replicas":       "3",
+					"memoryStorage":  "true",
+					"rateLimit":      "20000",
+					"heartbeat":      "1s",
+					"domain":         "hub",
 				},
-			},
+			}},
 			want: metadata{
 				natsURL:        "nats://localhost:4222",
 				name:           "myName",
@@ -49,14 +60,72 @@ func TestParseMetadata(t *testing.T) {
 				queueGroupName: "myQueue",
 				startSequence:  1,
 				startTime:      time.Unix(1629328511, 0),
-				deliverAll:     true,
 				flowControl:    true,
+				ackWait:        2 * time.Second,
+				maxDeliver:     10,
+				backOff:        []time.Duration{time.Millisecond * 500, time.Second * 2, time.Second * 10},
+				maxAckPending:  5000,
+				replicas:       3,
+				memoryStorage:  true,
+				rateLimit:      20000,
+				heartbeat:      time.Second * 1,
+				deliverPolicy:  nats.DeliverAllPolicy,
+				ackPolicy:      nats.AckExplicitPolicy,
+				domain:         "hub",
+			},
+			expectErr: false,
+		},
+		{
+			desc: "Valid Metadata with token",
+			input: pubsub.Metadata{Base: mdata.Base{
+				Properties: map[string]string{
+					"natsURL":        "nats://localhost:4222",
+					"name":           "myName",
+					"durableName":    "myDurable",
+					"queueGroupName": "myQueue",
+					"startTime":      "1629328511",
+					"flowControl":    "true",
+					"ackWait":        "2s",
+					"maxDeliver":     "10",
+					"backOff":        "500ms, 2s, 10s",
+					"maxAckPending":  "5000",
+					"replicas":       "3",
+					"memoryStorage":  "true",
+					"rateLimit":      "20000",
+					"heartbeat":      "1s",
+					"token":          "myToken",
+					"deliverPolicy":  "sequence",
+					"startSequence":  "5",
+					"ackPolicy":      "all",
+					"apiPrefix":      "HUB",
+				},
+			}},
+			want: metadata{
+				natsURL:        "nats://localhost:4222",
+				name:           "myName",
+				durableName:    "myDurable",
+				queueGroupName: "myQueue",
+				startSequence:  5,
+				startTime:      time.Unix(1629328511, 0),
+				flowControl:    true,
+				ackWait:        2 * time.Second,
+				maxDeliver:     10,
+				backOff:        []time.Duration{time.Millisecond * 500, time.Second * 2, time.Second * 10},
+				maxAckPending:  5000,
+				replicas:       3,
+				memoryStorage:  true,
+				rateLimit:      20000,
+				heartbeat:      time.Second * 1,
+				token:          "myToken",
+				deliverPolicy:  nats.DeliverByStartSequencePolicy,
+				ackPolicy:      nats.AckAllPolicy,
+				apiPrefix:      "HUB",
 			},
 			expectErr: false,
 		},
 		{
 			desc: "Invalid metadata with missing seed key",
-			input: pubsub.Metadata{
+			input: pubsub.Metadata{Base: mdata.Base{
 				Properties: map[string]string{
 					"natsURL":        "nats://localhost:4222",
 					"name":           "myName",
@@ -64,17 +133,16 @@ func TestParseMetadata(t *testing.T) {
 					"queueGroupName": "myQueue",
 					"startSequence":  "1",
 					"startTime":      "1629328511",
-					"deliverAll":     "true",
 					"flowControl":    "true",
 					"jwt":            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
 				},
-			},
+			}},
 			want:      metadata{},
 			expectErr: true,
 		},
 		{
 			desc: "Invalid metadata with missing jwt",
-			input: pubsub.Metadata{
+			input: pubsub.Metadata{Base: mdata.Base{
 				Properties: map[string]string{
 					"natsURL":        "nats://localhost:4222",
 					"name":           "myName",
@@ -82,11 +150,44 @@ func TestParseMetadata(t *testing.T) {
 					"queueGroupName": "myQueue",
 					"startSequence":  "1",
 					"startTime":      "1629328511",
-					"deliverAll":     "true",
 					"flowControl":    "true",
 					"seedKey":        "SUACS34K232OKPRDOMKC6QEWXWUDJTT6R6RZM2WPMURUS5Z3POU7BNIL4Y",
 				},
-			},
+			}},
+			want:      metadata{},
+			expectErr: true,
+		},
+		{
+			desc: "Invalid metadata with missing tls client key",
+			input: pubsub.Metadata{Base: mdata.Base{
+				Properties: map[string]string{
+					"natsURL":         "nats://localhost:4222",
+					"name":            "myName",
+					"durableName":     "myDurable",
+					"queueGroupName":  "myQueue",
+					"startSequence":   "1",
+					"startTime":       "1629328511",
+					"flowControl":     "true",
+					"tls_client_cert": "/path/to/tls.pem",
+				},
+			}},
+			want:      metadata{},
+			expectErr: true,
+		},
+		{
+			desc: "Invalid metadata with missing tls client",
+			input: pubsub.Metadata{Base: mdata.Base{
+				Properties: map[string]string{
+					"natsURL":        "nats://localhost:4222",
+					"name":           "myName",
+					"durableName":    "myDurable",
+					"queueGroupName": "myQueue",
+					"startSequence":  "1",
+					"startTime":      "1629328511",
+					"flowControl":    "true",
+					"tls_client_key": "/path/to/tls.key",
+				},
+			}},
 			want:      metadata{},
 			expectErr: true,
 		},

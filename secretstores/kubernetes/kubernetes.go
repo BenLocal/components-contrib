@@ -13,18 +13,23 @@ limitations under the License.
 
 package kubernetes
 
+//nolint:nosnakecase
 import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	kubeclient "github.com/dapr/components-contrib/authentication/kubernetes"
+	kubeclient "github.com/dapr/components-contrib/internal/authentication/kubernetes"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/kit/logger"
 )
+
+var _ secretstores.SecretStore = (*kubernetesSecretStore)(nil)
 
 type kubernetesSecretStore struct {
 	kubeClient kubernetes.Interface
@@ -37,7 +42,7 @@ func NewKubernetesSecretStore(logger logger.Logger) secretstores.SecretStore {
 }
 
 // Init creates a Kubernetes client.
-func (k *kubernetesSecretStore) Init(metadata secretstores.Metadata) error {
+func (k *kubernetesSecretStore) Init(_ context.Context, metadata secretstores.Metadata) error {
 	client, err := kubeclient.GetKubeClient()
 	if err != nil {
 		return err
@@ -48,7 +53,7 @@ func (k *kubernetesSecretStore) Init(metadata secretstores.Metadata) error {
 }
 
 // GetSecret retrieves a secret using a key and returns a map of decrypted string/string values.
-func (k *kubernetesSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (k *kubernetesSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	resp := secretstores.GetSecretResponse{
 		Data: map[string]string{},
 	}
@@ -57,7 +62,7 @@ func (k *kubernetesSecretStore) GetSecret(req secretstores.GetSecretRequest) (se
 		return resp, err
 	}
 
-	secret, err := k.kubeClient.CoreV1().Secrets(namespace).Get(context.TODO(), req.Name, meta_v1.GetOptions{})
+	secret, err := k.kubeClient.CoreV1().Secrets(namespace).Get(ctx, req.Name, meta_v1.GetOptions{}) //nolint:nosnakecase
 	if err != nil {
 		return resp, err
 	}
@@ -70,7 +75,7 @@ func (k *kubernetesSecretStore) GetSecret(req secretstores.GetSecretRequest) (se
 }
 
 // BulkGetSecret retrieves all secrets in the store and returns a map of decrypted string/string values.
-func (k *kubernetesSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (k *kubernetesSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	resp := secretstores.BulkGetSecretResponse{
 		Data: map[string]map[string]string{},
 	}
@@ -79,7 +84,7 @@ func (k *kubernetesSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequ
 		return resp, err
 	}
 
-	secrets, err := k.kubeClient.CoreV1().Secrets(namespace).List(context.TODO(), meta_v1.ListOptions{})
+	secrets, err := k.kubeClient.CoreV1().Secrets(namespace).List(ctx, meta_v1.ListOptions{}) //nolint:nosnakecase
 	if err != nil {
 		return resp, err
 	}
@@ -105,4 +110,17 @@ func (k *kubernetesSecretStore) getNamespaceFromMetadata(metadata map[string]str
 	}
 
 	return "", errors.New("namespace is missing on metadata and NAMESPACE env variable")
+}
+
+// Features returns the features available in this secret store.
+func (k *kubernetesSecretStore) Features() []secretstores.Feature {
+	return []secretstores.Feature{}
+}
+
+func (k *kubernetesSecretStore) GetComponentMetadata() map[string]string {
+	type unusedMetadataStruct struct{}
+	metadataStruct := unusedMetadataStruct{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

@@ -15,18 +15,20 @@ package rabbitmq
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
-	"github.com/dapr/kit/retry"
 )
 
 const (
@@ -57,19 +59,21 @@ type rabbitMQ struct {
 	connectionCount   int
 	metadata          *metadata
 	declaredExchanges map[string]bool
-	ctx               context.Context
-	cancel            context.CancelFunc
 
-	connectionDial func(host string) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error)
+	connectionDial func(protocol, uri string, tlsCfg *tls.Config, externalSasl bool) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error)
+	closeCh        chan struct{}
+	closed         atomic.Bool
+	wg             sync.WaitGroup
 
-	logger        logger.Logger
-	backOffConfig retry.Config
+	logger logger.Logger
 }
 
 // interface used to allow unit testing.
+//
+//nolint:interfacebloat
 type rabbitMQChannelBroker interface {
-	Publish(exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing) error
-	PublishWithDeferredConfirm(exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error)
+	PublishWithContext(ctx context.Context, exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing) error
+	PublishWithDeferredConfirmWithContext(ctx context.Context, exchange string, key string, mandatory bool, immediate bool, msg amqp.Publishing) (*amqp.DeferredConfirmation, error)
 	QueueDeclare(name string, durable bool, autoDelete bool, exclusive bool, noWait bool, args amqp.Table) (amqp.Queue, error)
 	QueueBind(name string, key string, exchange string, noWait bool, args amqp.Table) error
 	Consume(queue string, consumer string, autoAck bool, exclusive bool, noLocal bool, noWait bool, args amqp.Table) (<-chan amqp.Delivery, error)
@@ -93,16 +97,31 @@ func NewRabbitMQ(logger logger.Logger) pubsub.PubSub {
 		declaredExchanges: make(map[string]bool),
 		logger:            logger,
 		connectionDial:    dial,
+		closeCh:           make(chan struct{}),
 	}
 }
 
-func dial(host string) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error) {
-	conn, err := amqp.Dial(host)
+func dial(protocol, uri string, tlsCfg *tls.Config, externalSasl bool) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error) {
+	var (
+		conn *amqp.Connection
+		ch   *amqp.Channel
+		err  error
+	)
+
+	if protocol == protocolAMQPS {
+		if externalSasl {
+			conn, err = amqp.DialTLS_ExternalAuth(uri, tlsCfg)
+		} else {
+			conn, err = amqp.DialTLS(uri, tlsCfg)
+		}
+	} else {
+		conn, err = amqp.Dial(uri)
+	}
 	if err != nil {
 		return nil, nil, err
 	}
 
-	ch, err := conn.Channel()
+	ch, err = conn.Channel()
 	if err != nil {
 		conn.Close()
 		return nil, nil, err
@@ -112,23 +131,11 @@ func dial(host string) (rabbitMQConnectionBroker, rabbitMQChannelBroker, error) 
 }
 
 // Init does metadata parsing and connection creation.
-func (r *rabbitMQ) Init(metadata pubsub.Metadata) error {
-	meta, err := createMetadata(metadata)
+func (r *rabbitMQ) Init(_ context.Context, metadata pubsub.Metadata) error {
+	meta, err := createMetadata(metadata, r.logger)
 	if err != nil {
 		return err
 	}
-
-	// Default retry configuration is used if no backOff properties are set.
-	// backOff max retry config is set to 0, which means not to retry by default.
-	r.backOffConfig = retry.DefaultConfigWithNoRetry()
-	if err := retry.DecodeConfigWithPrefix(
-		&r.backOffConfig,
-		metadata.Properties,
-		"backOff"); err != nil {
-		return err
-	}
-
-	r.ctx, r.cancel = context.WithCancel(context.Background())
 
 	r.metadata = meta
 
@@ -161,7 +168,12 @@ func (r *rabbitMQ) reconnect(connectionCount int) error {
 		return err
 	}
 
-	r.connection, r.channel, err = r.connectionDial(r.metadata.host)
+	tlsCfg, err := pubsub.ConvertTLSPropertiesToTLSConfig(r.metadata.TLSProperties)
+	if err != nil {
+		return err
+	}
+
+	r.connection, r.channel, err = r.connectionDial(r.metadata.protocol, r.metadata.connectionURI(), tlsCfg, r.metadata.saslExternal)
 	if err != nil {
 		r.reset()
 
@@ -184,7 +196,7 @@ func (r *rabbitMQ) reconnect(connectionCount int) error {
 	return nil
 }
 
-func (r *rabbitMQ) publishSync(req *pubsub.PublishRequest) (rabbitMQChannelBroker, int, error) {
+func (r *rabbitMQ) publishSync(ctx context.Context, req *pubsub.PublishRequest) (rabbitMQChannelBroker, int, error) {
 	r.channelMutex.Lock()
 	defer r.channelMutex.Unlock()
 
@@ -202,10 +214,23 @@ func (r *rabbitMQ) publishSync(req *pubsub.PublishRequest) (rabbitMQChannelBroke
 		routingKey = val
 	}
 
-	confirm, err := r.channel.PublishWithDeferredConfirm(req.Topic, routingKey, false, false, amqp.Publishing{
+	ttl, ok, err := contribMetadata.TryGetTTL(req.Metadata)
+	if err != nil {
+		r.logger.Warnf("%s publishing to %s failed parse TryGetTTL: %v, it is ignored.", logMessagePrefix, req.Topic, err)
+	}
+	var expiration string
+	if ok {
+		// RabbitMQ expects the duration in ms
+		expiration = strconv.FormatInt(ttl.Milliseconds(), 10)
+	} else if r.metadata.defaultQueueTTL != nil {
+		expiration = strconv.FormatInt(r.metadata.defaultQueueTTL.Milliseconds(), 10)
+	}
+
+	confirm, err := r.channel.PublishWithDeferredConfirmWithContext(ctx, req.Topic, routingKey, false, false, amqp.Publishing{
 		ContentType:  "text/plain",
 		Body:         req.Data,
 		DeliveryMode: r.metadata.deliveryMode,
+		Expiration:   expiration,
 	})
 	if err != nil {
 		r.logger.Errorf("%s publishing to %s failed in channel.Publish: %v", logMessagePrefix, req.Topic, err)
@@ -226,13 +251,17 @@ func (r *rabbitMQ) publishSync(req *pubsub.PublishRequest) (rabbitMQChannelBroke
 	return r.channel, r.connectionCount, nil
 }
 
-func (r *rabbitMQ) Publish(req *pubsub.PublishRequest) error {
+func (r *rabbitMQ) Publish(ctx context.Context, req *pubsub.PublishRequest) error {
+	if r.closed.Load() {
+		return errors.New("component is closed")
+	}
+
 	r.logger.Debugf("%s publishing message to %s", logMessagePrefix, req.Topic)
 
 	attempt := 0
 	for {
 		attempt++
-		channel, connectionCount, err := r.publishSync(req)
+		channel, connectionCount, err := r.publishSync(ctx, req)
 		if err == nil {
 			return nil
 		}
@@ -242,16 +271,29 @@ func (r *rabbitMQ) Publish(req *pubsub.PublishRequest) error {
 		}
 		if mustReconnect(channel, err) {
 			r.logger.Warnf("%s publisher is reconnecting in %s ...", logMessagePrefix, r.metadata.reconnectWait.String())
-			time.Sleep(r.metadata.reconnectWait)
+			select {
+			case <-time.After(r.metadata.reconnectWait):
+			case <-ctx.Done():
+				return nil
+			}
+
 			r.reconnect(connectionCount)
 		} else {
 			r.logger.Warnf("%s publishing attempt (%d/%d) failed: %v", logMessagePrefix, attempt, publishMaxRetries, err)
-			time.Sleep(publishRetryWaitSeconds * time.Second)
+			select {
+			case <-time.After(publishRetryWaitSeconds * time.Second):
+			case <-ctx.Done():
+				return nil
+			}
 		}
 	}
 }
 
 func (r *rabbitMQ) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, handler pubsub.Handler) error {
+	if r.closed.Load() {
+		return errors.New("component is closed")
+	}
+
 	if r.metadata.consumerID == "" {
 		return errors.New("consumerID is required for subscriptions")
 	}
@@ -262,7 +304,21 @@ func (r *rabbitMQ) Subscribe(ctx context.Context, req pubsub.SubscribeRequest, h
 	// Do not set a timeout on the context, as we're just waiting for the first ack; we're using a semaphore instead
 	ackCh := make(chan struct{}, 1)
 	defer close(ackCh)
-	go r.subscribeForever(ctx, req, queueName, handler, ackCh)
+
+	subctx, cancel := context.WithCancel(ctx)
+	r.wg.Add(2)
+	go func() {
+		defer r.wg.Done()
+		r.subscribeForever(subctx, req, queueName, handler, ackCh)
+	}()
+	go func() {
+		defer r.wg.Done()
+		defer cancel()
+		select {
+		case <-subctx.Done():
+		case <-r.closeCh:
+		}
+	}()
 
 	// Wait for the ack for 1 minute or return an error
 	select {
@@ -425,7 +481,12 @@ func (r *rabbitMQ) subscribeForever(ctx context.Context, req pubsub.SubscribeReq
 
 		if mustReconnect(channel, err) {
 			r.logger.Warnf("%s subscriber is reconnecting in %s ...", logMessagePrefix, r.metadata.reconnectWait.String())
-			time.Sleep(r.metadata.reconnectWait)
+			select {
+			case <-time.After(r.metadata.reconnectWait):
+			case <-ctx.Done():
+				r.logger.Infof("%s subscription for %s has context canceled", logMessagePrefix, queueName)
+				return
+			}
 			r.reconnect(connectionCount)
 		}
 	}
@@ -447,13 +508,17 @@ func (r *rabbitMQ) listenMessages(ctx context.Context, channel rabbitMQChannelBr
 			switch r.metadata.concurrency {
 			case pubsub.Single:
 				err = r.handleMessage(ctx, d, topic, handler)
+				if err != nil && mustReconnect(channel, err) {
+					return err
+				}
 			case pubsub.Parallel:
+				r.wg.Add(1)
 				go func(d amqp.Delivery) {
-					err = r.handleMessage(ctx, d, topic, handler)
+					defer r.wg.Done()
+					if err := r.handleMessage(ctx, d, topic, handler); err != nil {
+						r.logger.Errorf("%s error handling message: %v", logMessagePrefix, err)
+					}
 				}(d)
-			}
-			if err != nil && mustReconnect(channel, err) {
-				return err
 			}
 		}
 	}
@@ -465,30 +530,23 @@ func (r *rabbitMQ) handleMessage(ctx context.Context, d amqp.Delivery, topic str
 		Topic: topic,
 	}
 
-	b := r.backOffConfig.NewBackOffWithContext(ctx)
-	err := retry.NotifyRecover(func() error {
-		return handler(ctx, pubsubMsg)
-	}, b, func(err error, d time.Duration) {
-		r.logger.Errorf("%s error handling message from topic '%s', %s", logMessagePrefix, topic, err)
-	}, func() {
-		r.logger.Infof("%s successfully processed message after it previously failed from topic '%s'", logMessagePrefix, topic)
-	})
+	err := handler(ctx, pubsubMsg)
 
-	//nolint:nestif
-	// if message is not auto acked we need to ack/nack
-	if !r.metadata.autoAck {
-		if err != nil {
-			requeue := r.metadata.requeueInFailure && !d.Redelivered
+	if err != nil {
+		r.logger.Errorf("%s handling message from topic '%s', %s", errorMessagePrefix, topic, err)
 
-			r.logger.Debugf("%s nacking message '%s' from topic '%s', requeue=%t", logMessagePrefix, d.MessageId, topic, requeue)
-			if err = d.Nack(false, requeue); err != nil {
+		if !r.metadata.autoAck {
+			// if message is not auto acked we need to ack/nack
+			r.logger.Debugf("%s nacking message '%s' from topic '%s', requeue=%t", logMessagePrefix, d.MessageId, topic, r.metadata.requeueInFailure)
+			if err = d.Nack(false, r.metadata.requeueInFailure); err != nil {
 				r.logger.Errorf("%s error nacking message '%s' from topic '%s', %s", logMessagePrefix, d.MessageId, topic, err)
 			}
-		} else {
-			r.logger.Debugf("%s acking message '%s' from topic '%s'", logMessagePrefix, d.MessageId, topic)
-			if err = d.Ack(false); err != nil {
-				r.logger.Errorf("%s error acking message '%s' from topic '%s', %s", logMessagePrefix, d.MessageId, topic, err)
-			}
+		}
+	} else if !r.metadata.autoAck {
+		// if message is not auto acked we need to ack/nack
+		r.logger.Debugf("%s acking message '%s' from topic '%s'", logMessagePrefix, d.MessageId, topic)
+		if err = d.Ack(false); err != nil {
+			r.logger.Errorf("%s error acking message '%s' from topic '%s', %s", logMessagePrefix, d.MessageId, topic, err)
 		}
 	}
 
@@ -550,21 +608,25 @@ func (r *rabbitMQ) reset() (err error) {
 }
 
 func (r *rabbitMQ) isStopped() bool {
-	return r.ctx.Err() != nil
+	return r.closed.Load()
 }
 
+// Close closes the rabbitMQ connection. Blocks until all go routines are done.
 func (r *rabbitMQ) Close() error {
 	r.channelMutex.Lock()
 	defer r.channelMutex.Unlock()
 
-	r.cancel()
-	err := r.reset()
+	if r.closed.CompareAndSwap(false, true) {
+		close(r.closeCh)
+	}
 
-	return err
+	defer r.wg.Wait()
+
+	return r.reset()
 }
 
 func (r *rabbitMQ) Features() []pubsub.Feature {
-	return nil
+	return []pubsub.Feature{pubsub.FeatureMessageTTL}
 }
 
 func mustReconnect(channel rabbitMQChannelBroker, err error) bool {

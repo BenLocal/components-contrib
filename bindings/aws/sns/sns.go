@@ -20,8 +20,8 @@ import (
 
 	"github.com/aws/aws-sdk-go/service/sns"
 
-	aws_auth "github.com/dapr/components-contrib/authentication/aws"
 	"github.com/dapr/components-contrib/bindings"
+	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
 	"github.com/dapr/kit/logger"
 )
 
@@ -48,12 +48,12 @@ type dataPayload struct {
 }
 
 // NewAWSSNS creates a new AWSSNS binding instance.
-func NewAWSSNS(logger logger.Logger) *AWSSNS {
+func NewAWSSNS(logger logger.Logger) bindings.OutputBinding {
 	return &AWSSNS{logger: logger}
 }
 
 // Init does metadata parsing.
-func (a *AWSSNS) Init(metadata bindings.Metadata) error {
+func (a *AWSSNS) Init(_ context.Context, metadata bindings.Metadata) error {
 	m, err := a.parseMetadata(metadata)
 	if err != nil {
 		return err
@@ -84,7 +84,7 @@ func (a *AWSSNS) parseMetadata(metadata bindings.Metadata) (*snsMetadata, error)
 }
 
 func (a *AWSSNS) getClient(metadata *snsMetadata) (*sns.SNS, error) {
-	sess, err := aws_auth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
+	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -107,13 +107,11 @@ func (a *AWSSNS) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bind
 	msg := fmt.Sprintf("%v", payload.Message)
 	subject := fmt.Sprintf("%v", payload.Subject)
 
-	input := &sns.PublishInput{
+	_, err = a.client.PublishWithContext(ctx, &sns.PublishInput{
 		Message:  &msg,
 		Subject:  &subject,
 		TopicArn: &a.topicARN,
-	}
-
-	_, err = a.client.Publish(input)
+	})
 	if err != nil {
 		return nil, err
 	}

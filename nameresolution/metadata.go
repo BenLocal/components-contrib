@@ -13,16 +13,9 @@ limitations under the License.
 
 package nameresolution
 
-const (
-	// MDNSInstanceName is the instance name which is broadcasted.
-	MDNSInstanceName string = "name"
-	// MDNSInstanceAddress is the address of the instance.
-	MDNSInstanceAddress string = "address"
-	// MDNSInstancePort is the port of instance.
-	MDNSInstancePort string = "port"
-	// MDNSInstanceID is an optional unique instance ID.
-	MDNSInstanceID string = "instance"
+import "github.com/dapr/components-contrib/metadata"
 
+const (
 	// HostAddress is the address of the instance.
 	HostAddress string = "HOST_ADDRESS"
 	// DaprHTTPPort is the dapr api http port.
@@ -37,6 +30,6 @@ const (
 
 // Metadata contains a name resolution specific set of metadata properties.
 type Metadata struct {
-	Properties    map[string]string `json:"properties"`
+	metadata.Base `json:",inline"`
 	Configuration interface{}
 }

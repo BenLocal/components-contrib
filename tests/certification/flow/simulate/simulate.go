@@ -14,10 +14,10 @@ limitations under the License.
 package simulate
 
 import (
+	"errors"
 	"sync/atomic"
 
 	"github.com/dapr/components-contrib/tests/certification/flow"
-	"github.com/pkg/errors"
 )
 
 func PeriodicError(ctx flow.Context, frequency uint64) func() error {
@@ -33,7 +33,7 @@ func PeriodicError(ctx flow.Context, frequency uint64) func() error {
 			ec := atomic.AddUint64(&errorCount, 1)
 			ctx.Logf("Simulating error %d", ec)
 
-			return errors.Errorf("simulated error")
+			return errors.New("simulated error")
 		}
 
 		return nil

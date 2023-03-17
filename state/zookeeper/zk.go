@@ -14,19 +14,22 @@ limitations under the License.
 package zookeeper
 
 import (
+	"context"
 	"errors"
 	"path"
+	reflect "reflect"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/agrea/ptr"
+	"github.com/go-zookeeper/zk"
 	"github.com/hashicorp/go-multierror"
 	jsoniter "github.com/json-iterator/go"
-	"github.com/samuel/go-zookeeper/zk"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 const (
@@ -56,16 +59,11 @@ type config struct {
 	keyPrefixPath     string
 }
 
-func newConfig(metadata map[string]string) (c *config, err error) {
-	var buf []byte
-
-	if buf, err = jsoniter.ConfigFastest.Marshal(metadata); err != nil {
-		return
-	}
-
+func newConfig(meta map[string]string) (c *config, err error) {
 	var props properties
-	if err = jsoniter.ConfigFastest.Unmarshal(buf, &props); err != nil {
-		return
+	errDecode := metadata.DecodeMetadata(meta, &props)
+	if errDecode != nil {
+		return nil, errDecode
 	}
 
 	return props.parse()
@@ -129,14 +127,14 @@ var (
 )
 
 // NewZookeeperStateStore returns a new Zookeeper state store.
-func NewZookeeperStateStore(logger logger.Logger) *StateStore {
+func NewZookeeperStateStore(logger logger.Logger) state.Store {
 	return &StateStore{
 		features: []state.Feature{state.FeatureETag},
 		logger:   logger,
 	}
 }
 
-func (s *StateStore) Init(metadata state.Metadata) (err error) {
+func (s *StateStore) Init(_ context.Context, metadata state.Metadata) (err error) {
 	var c *config
 
 	if c, err = newConfig(metadata.Properties); err != nil {
@@ -161,7 +159,7 @@ func (s *StateStore) Features() []state.Feature {
 }
 
 // Get retrieves state from Zookeeper with a key.
-func (s *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (s *StateStore) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	value, stat, err := s.conn.Get(s.prefixedKey(req.Key))
 	if err != nil {
 		if errors.Is(err, zk.ErrNoNode) {
@@ -173,43 +171,41 @@ func (s *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
 
 	return &state.GetResponse{
 		Data: value,
-		ETag: ptr.String(strconv.Itoa(int(stat.Version))),
+		ETag: ptr.Of(strconv.Itoa(int(stat.Version))),
 	}, nil
 }
 
 // BulkGet performs a bulks get operations.
-func (s *StateStore) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
+func (s *StateStore) BulkGet(ctx context.Context, req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
 	// TODO: replace with Multi for performance
 	return false, nil, nil
 }
 
 // Delete performs a delete operation.
-func (s *StateStore) Delete(req *state.DeleteRequest) error {
+func (s *StateStore) Delete(ctx context.Context, req *state.DeleteRequest) error {
 	r, err := s.newDeleteRequest(req)
 	if err != nil {
 		return err
 	}
 
-	return state.DeleteWithOptions(func(req *state.DeleteRequest) error {
-		err := s.conn.Delete(r.Path, r.Version)
-		if errors.Is(err, zk.ErrNoNode) {
-			return nil
-		}
-
-		if err != nil {
-			if req.ETag != nil {
-				return state.NewETagError(state.ETagMismatch, err)
-			}
-
-			return err
-		}
-
+	err = s.conn.Delete(r.Path, r.Version)
+	if errors.Is(err, zk.ErrNoNode) {
 		return nil
-	}, req)
+	}
+
+	if err != nil {
+		if req.ETag != nil {
+			return state.NewETagError(state.ETagMismatch, err)
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 // BulkDelete performs a bulk delete operation.
-func (s *StateStore) BulkDelete(reqs []state.DeleteRequest) error {
+func (s *StateStore) BulkDelete(ctx context.Context, reqs []state.DeleteRequest) error {
 	ops := make([]interface{}, 0, len(reqs))
 
 	for i := range reqs {
@@ -236,33 +232,30 @@ func (s *StateStore) BulkDelete(reqs []state.DeleteRequest) error {
 }
 
 // Set saves state into Zookeeper.
-func (s *StateStore) Set(req *state.SetRequest) error {
+func (s *StateStore) Set(ctx context.Context, req *state.SetRequest) error {
 	r, err := s.newSetDataRequest(req)
 	if err != nil {
 		return err
 	}
 
-	return state.SetWithOptions(func(req *state.SetRequest) error {
-		_, err = s.conn.Set(r.Path, r.Data, r.Version)
+	_, err = s.conn.Set(r.Path, r.Data, r.Version)
+	if errors.Is(err, zk.ErrNoNode) {
+		_, err = s.conn.Create(r.Path, r.Data, 0, nil)
+	}
 
-		if errors.Is(err, zk.ErrNoNode) {
-			_, err = s.conn.Create(r.Path, r.Data, 0, nil)
+	if err != nil {
+		if req.ETag != nil {
+			return state.NewETagError(state.ETagMismatch, err)
 		}
 
-		if err != nil {
-			if req.ETag != nil {
-				return state.NewETagError(state.ETagMismatch, err)
-			}
+		return err
+	}
 
-			return err
-		}
-
-		return nil
-	}, req)
+	return nil
 }
 
 // BulkSet performs a bulks save operation.
-func (s *StateStore) BulkSet(reqs []state.SetRequest) error {
+func (s *StateStore) BulkSet(ctx context.Context, reqs []state.SetRequest) error {
 	ops := make([]interface{}, 0, len(reqs))
 
 	for i := range reqs {
@@ -389,4 +382,11 @@ func (s *StateStore) marshalData(v interface{}) ([]byte, error) {
 	}
 
 	return jsoniter.ConfigFastest.Marshal(v)
+}
+
+func (s *StateStore) GetComponentMetadata() map[string]string {
+	metadataStruct := properties{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

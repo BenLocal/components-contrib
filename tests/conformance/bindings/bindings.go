@@ -19,12 +19,14 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/tests/conformance/utils"
 	"github.com/dapr/kit/config"
 	"github.com/dapr/kit/logger"
@@ -38,7 +40,7 @@ const (
 	defaultOutputData = "[{\"eventType\":\"test\",\"eventTime\": \"2018-01-25T22:12:19.4556811Z\",\"subject\":\"dapr-conf-tests\",\"id\":\"A234-1234-1234\",\"data\":\"root/>\"}]"
 )
 
-// nolint:gochecknoglobals
+//nolint:gochecknoglobals
 var (
 	testLogger = logger.NewLogger("bindingsTest")
 
@@ -125,16 +127,16 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 		// Check for an output binding specific operation before init
 		if config.HasOperation("operations") {
 			testLogger.Info("Init output binding ...")
-			err := outputBinding.Init(bindings.Metadata{
-				Properties: props,
+			err := outputBinding.Init(context.Background(), bindings.Metadata{
+				Base: metadata.Base{Properties: props},
 			})
 			assert.NoError(t, err, "expected no error setting up output binding")
 		}
 		// Check for an input binding specific operation before init
 		if config.HasOperation("read") {
 			testLogger.Info("Init input binding ...")
-			err := inputBinding.Init(bindings.Metadata{
-				Properties: props,
+			err := inputBinding.Init(context.Background(), bindings.Metadata{
+				Base: metadata.Base{Properties: props},
 			})
 			assert.NoError(t, err, "expected no error setting up input binding")
 		}
@@ -142,23 +144,27 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 	})
 
 	t.Run("ping", func(t *testing.T) {
-		errInp := bindings.PingInpBinding(inputBinding)
-		// TODO: Ideally, all stable components should implenment ping function,
-		// so will only assert assert.Nil(t, err) finally, i.e. when current implementation
-		// implements ping in existing stable components
-		if errInp != nil {
-			assert.EqualError(t, errInp, "Ping is not implemented by this input binding")
-		} else {
-			assert.Nil(t, errInp)
+		if config.HasOperation("read") {
+			errInp := bindings.PingInpBinding(context.Background(), inputBinding)
+			// TODO: Ideally, all stable components should implenment ping function,
+			// so will only assert assert.NoError(t, err) finally, i.e. when current implementation
+			// implements ping in existing stable components
+			if errInp != nil {
+				assert.EqualError(t, errInp, "ping is not implemented by this input binding")
+			} else {
+				assert.NoError(t, errInp)
+			}
 		}
-		errOut := bindings.PingOutBinding(outputBinding)
-		// TODO: Ideally, all stable components should implenment ping function,
-		// so will only assert assert.Nil(t, err) finally, i.e. when current implementation
-		// implements ping in existing stable components
-		if errOut != nil {
-			assert.EqualError(t, errOut, "Ping is not implemented by this output binding")
-		} else {
-			assert.Nil(t, errOut)
+		if config.HasOperation("operations") {
+			errOut := bindings.PingOutBinding(context.Background(), outputBinding)
+			// TODO: Ideally, all stable components should implenment ping function,
+			// so will only assert assert.NoError(t, err) finally, i.e. when current implementation
+			// implements ping in existing stable components
+			if errOut != nil {
+				assert.EqualError(t, errOut, "ping is not implemented by this output binding")
+			} else {
+				assert.NoError(t, errOut)
+			}
 		}
 	})
 
@@ -184,27 +190,27 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 		})
 	}
 
-	inputBindingCall := 0
-	readChan := make(chan int)
+	inputBindingCall := atomic.Int32{}
+	readChan := make(chan int, 1)
+	readCtx, readCancel := context.WithCancel(context.Background())
+	defer readCancel()
 	if config.HasOperation("read") {
 		t.Run("read", func(t *testing.T) {
 			testLogger.Info("Read test running ...")
-			go func() {
-				testLogger.Info("Read callback invoked ...")
-				err := inputBinding.Read(func(ctx context.Context, r *bindings.ReadResponse) ([]byte, error) {
-					inputBindingCall++
-					readChan <- inputBindingCall
+			err := inputBinding.Read(readCtx, func(ctx context.Context, r *bindings.ReadResponse) ([]byte, error) {
+				t.Logf("Read message: %s", string(r.Data))
+				v := inputBindingCall.Add(1)
+				readChan <- int(v)
 
-					return nil, nil
-				})
-				assert.True(t, err == nil || errors.Is(err, context.Canceled), "expected Read canceled on Close")
-			}()
-			testLogger.Info("Read test done.")
+				return nil, nil
+			})
+			assert.Truef(t, err == nil || errors.Is(err, context.Canceled), "expected Read canceled on Close, got: %v", err)
 		})
 		// Special case for message brokers that are also bindings
 		// Need a small wait here because with brokers like MQTT
 		// if you publish before there is a consumer, the message is thrown out
 		// Currently, there is no way to know when Read is successfully subscribed.
+		t.Logf("Sleeping for %v", config.ReadBindingWait)
 		time.Sleep(config.ReadBindingWait)
 	}
 
@@ -216,7 +222,7 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 			testLogger.Info("Create test running ...")
 			req := config.createInvokeRequest()
 			req.Operation = bindings.CreateOperation
-			_, err := outputBinding.Invoke(context.TODO(), &req)
+			_, err := outputBinding.Invoke(context.Background(), &req)
 			assert.NoError(t, err, "expected no error invoking output binding")
 			createPerformed = true
 			testLogger.Info("Create test done.")
@@ -229,8 +235,8 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 			testLogger.Info("Get test running ...")
 			req := config.createInvokeRequest()
 			req.Operation = bindings.GetOperation
-			resp, err := outputBinding.Invoke(context.TODO(), &req)
-			assert.Nil(t, err, "expected no error invoking output binding")
+			resp, err := outputBinding.Invoke(context.Background(), &req)
+			assert.NoError(t, err, "expected no error invoking output binding")
 			if createPerformed {
 				assert.Equal(t, req.Data, resp.Data)
 			}
@@ -244,7 +250,7 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 			testLogger.Info("List test running ...")
 			req := config.createInvokeRequest()
 			req.Operation = bindings.ListOperation
-			_, err := outputBinding.Invoke(context.TODO(), &req)
+			_, err := outputBinding.Invoke(context.Background(), &req)
 			assert.NoError(t, err, "expected no error invoking output binding")
 			testLogger.Info("List test done.")
 		})
@@ -256,10 +262,10 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 			// To stop the test from hanging if there's no response, we can setup a simple timeout.
 			select {
 			case <-readChan:
-				assert.Greater(t, inputBindingCall, 0)
+				assert.Greater(t, inputBindingCall.Load(), int32(0))
 				testLogger.Info("Read channel signalled.")
 			case <-time.After(config.ReadBindingTimeout):
-				assert.Greater(t, inputBindingCall, 0)
+				assert.Greaterf(t, inputBindingCall.Load(), int32(0), "Timed out after %v while reading", config.ReadBindingTimeout)
 				testLogger.Info("Read timeout.")
 			}
 			testLogger.Info("Verify Read test done.")
@@ -272,12 +278,12 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 			testLogger.Info("Delete test running ...")
 			req := config.createInvokeRequest()
 			req.Operation = bindings.DeleteOperation
-			_, err := outputBinding.Invoke(context.TODO(), &req)
-			assert.Nil(t, err, "expected no error invoking output binding")
+			_, err := outputBinding.Invoke(context.Background(), &req)
+			assert.NoError(t, err, "expected no error invoking output binding")
 
 			if createPerformed && config.HasOperation(string(bindings.GetOperation)) {
 				req.Operation = bindings.GetOperation
-				resp, err := outputBinding.Invoke(context.TODO(), &req)
+				resp, err := outputBinding.Invoke(context.Background(), &req)
 				assert.NoError(t, err, "expected no error invoking output binding")
 				assert.NotNil(t, resp)
 				assert.Nil(t, resp.Data)
@@ -291,10 +297,8 @@ func ConformanceTests(t *testing.T, props map[string]string, inputBinding bindin
 		// Check for an input-binding specific operation before close
 		if config.HasOperation("read") {
 			testLogger.Info("Closing read connection ...")
-			if closer, ok := inputBinding.(io.Closer); ok {
-				err := closer.Close()
-				assert.NoError(t, err, "expected no error closing input binding")
-			}
+			err := inputBinding.Close()
+			assert.NoError(t, err, "expected no error closing input binding")
 		}
 		// Check for an output-binding specific operation before close
 		if config.HasOperation("operations") {

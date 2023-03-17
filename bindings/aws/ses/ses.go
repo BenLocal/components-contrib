@@ -23,7 +23,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 
-	aws_auth "github.com/dapr/components-contrib/authentication/aws"
+	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
 
 	"github.com/aws/aws-sdk-go/service/ses"
 
@@ -56,12 +56,12 @@ type sesMetadata struct {
 }
 
 // NewAWSSES creates a new AWSSES binding instance.
-func NewAWSSES(logger logger.Logger) *AWSSES {
+func NewAWSSES(logger logger.Logger) bindings.OutputBinding {
 	return &AWSSES{logger: logger}
 }
 
 // Init does metadata parsing.
-func (a *AWSSES) Init(metadata bindings.Metadata) error {
+func (a *AWSSES) Init(_ context.Context, metadata bindings.Metadata) error {
 	// Parse input metadata
 	meta, err := a.parseMetadata(metadata)
 	if err != nil {
@@ -192,7 +192,7 @@ func (metadata sesMetadata) mergeWithRequestMetadata(req *bindings.InvokeRequest
 }
 
 func (a *AWSSES) getClient(metadata *sesMetadata) (*ses.SES, error) {
-	sess, err := aws_auth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, "")
+	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, "")
 	if err != nil {
 		return nil, fmt.Errorf("SES binding error: error creating AWS session %w", err)
 	}

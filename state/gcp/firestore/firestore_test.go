@@ -18,6 +18,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 )
 
@@ -34,9 +35,10 @@ func TestGetFirestoreMetadata(t *testing.T) {
 			"token_uri":                   "https://oauth2.googleapis.com/token",
 			"auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
 			"client_x509_cert_url":        "https://www.googleapis.com/robot/v1/metadata/x509/x",
+			"noindex":                     "true",
 		}
 		m := state.Metadata{
-			Properties: properties,
+			Base: metadata.Base{Properties: properties},
 		}
 		metadata, err := getFirestoreMetadata(m)
 		assert.Nil(t, err)
@@ -45,6 +47,7 @@ func TestGetFirestoreMetadata(t *testing.T) {
 		assert.Equal(t, "123", metadata.PrivateKeyID)
 		assert.Equal(t, "mykey", metadata.PrivateKey)
 		assert.Equal(t, defaultEntityKind, metadata.EntityKind)
+		assert.Equal(t, true, metadata.NoIndex)
 	})
 
 	t.Run("With incorrect properties", func(t *testing.T) {
@@ -55,7 +58,7 @@ func TestGetFirestoreMetadata(t *testing.T) {
 			"private_key":    "mykey",
 		}
 		m := state.Metadata{
-			Properties: properties,
+			Base: metadata.Base{Properties: properties},
 		}
 		_, err := getFirestoreMetadata(m)
 		assert.NotNil(t, err)

@@ -14,8 +14,11 @@ limitations under the License.
 package dynamodb
 
 import (
-	"encoding/json"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -25,8 +28,10 @@ import (
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	jsoniterator "github.com/json-iterator/go"
 
-	aws_auth "github.com/dapr/components-contrib/authentication/aws"
+	awsAuth "github.com/dapr/components-contrib/internal/authentication/aws"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
+	"github.com/dapr/kit/logger"
 )
 
 // StateStore is a DynamoDB state store.
@@ -34,6 +39,7 @@ type StateStore struct {
 	client           dynamodbiface.DynamoDBAPI
 	table            string
 	ttlAttributeName string
+	partitionKey     string
 }
 
 type dynamoDBMetadata struct {
@@ -44,15 +50,23 @@ type dynamoDBMetadata struct {
 	SessionToken     string `json:"sessionToken"`
 	Table            string `json:"table"`
 	TTLAttributeName string `json:"ttlAttributeName"`
+	PartitionKey     string `json:"partitionKey"`
 }
 
+const (
+	defaultPartitionKeyName = "key"
+	metadataPartitionKey    = "partitionKey"
+)
+
 // NewDynamoDBStateStore returns a new dynamoDB state store.
-func NewDynamoDBStateStore() state.Store {
-	return &StateStore{}
+func NewDynamoDBStateStore(_ logger.Logger) state.Store {
+	return &StateStore{
+		partitionKey: defaultPartitionKeyName,
+	}
 }
 
 // Init does metadata and connection parsing.
-func (d *StateStore) Init(metadata state.Metadata) error {
+func (d *StateStore) Init(_ context.Context, metadata state.Metadata) error {
 	meta, err := d.getDynamoDBMetadata(metadata)
 	if err != nil {
 		return err
@@ -66,28 +80,29 @@ func (d *StateStore) Init(metadata state.Metadata) error {
 	d.client = client
 	d.table = meta.Table
 	d.ttlAttributeName = meta.TTLAttributeName
+	d.partitionKey = meta.PartitionKey
 
 	return nil
 }
 
 // Features returns the features available in this state store.
 func (d *StateStore) Features() []state.Feature {
-	return nil
+	return []state.Feature{state.FeatureETag}
 }
 
 // Get retrieves a dynamoDB item.
-func (d *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (d *StateStore) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	input := &dynamodb.GetItemInput{
 		ConsistentRead: aws.Bool(req.Options.Consistency == state.Strong),
 		TableName:      aws.String(d.table),
 		Key: map[string]*dynamodb.AttributeValue{
-			"key": {
+			d.partitionKey: {
 				S: aws.String(req.Key),
 			},
 		},
 	}
 
-	result, err := d.client.GetItem(input)
+	result, err := d.client.GetItemWithContext(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -114,51 +129,32 @@ func (d *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
 		}
 	}
 
-	return &state.GetResponse{
+	resp := &state.GetResponse{
 		Data: []byte(output),
-	}, nil
+	}
+
+	var etag string
+	if etagVal, ok := result.Item["etag"]; ok {
+		if err = dynamodbattribute.Unmarshal(etagVal, &etag); err != nil {
+			return nil, err
+		}
+		resp.ETag = &etag
+	}
+
+	return resp, nil
 }
 
 // BulkGet performs a bulk get operations.
-func (d *StateStore) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
+func (d *StateStore) BulkGet(ctx context.Context, req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
 	// TODO: replace with dynamodb.BatchGetItem for performance
 	return false, nil, nil
 }
 
 // Set saves a dynamoDB item.
-func (d *StateStore) Set(req *state.SetRequest) error {
-	value, err := d.marshalToString(req.Value)
+func (d *StateStore) Set(ctx context.Context, req *state.SetRequest) error {
+	item, err := d.getItemFromReq(req)
 	if err != nil {
-		return fmt.Errorf("dynamodb error: failed to set key %s: %s", req.Key, err)
-	}
-
-	ttl, err := d.parseTTL(req)
-	if err != nil {
-		return fmt.Errorf("dynamodb error: failed to parse ttlInSeconds: %s", err)
-	}
-
-	var item map[string]*dynamodb.AttributeValue
-	if ttl != nil {
-		item = map[string]*dynamodb.AttributeValue{
-			"key": {
-				S: aws.String(req.Key),
-			},
-			"value": {
-				S: aws.String(value),
-			},
-			d.ttlAttributeName: {
-				N: aws.String(strconv.FormatInt(*ttl, 10)),
-			},
-		}
-	} else {
-		item = map[string]*dynamodb.AttributeValue{
-			"key": {
-				S: aws.String(req.Key),
-			},
-			"value": {
-				S: aws.String(value),
-			},
-		}
+		return err
 	}
 
 	input := &dynamodb.PutItemInput{
@@ -166,48 +162,52 @@ func (d *StateStore) Set(req *state.SetRequest) error {
 		TableName: &d.table,
 	}
 
-	_, e := d.client.PutItem(input)
+	haveEtag := false
+	if req.ETag != nil && *req.ETag != "" {
+		haveEtag = true
+		condExpr := "etag = :etag"
+		input.ConditionExpression = &condExpr
+		exprAttrValues := make(map[string]*dynamodb.AttributeValue)
+		exprAttrValues[":etag"] = &dynamodb.AttributeValue{
+			S: req.ETag,
+		}
+		input.ExpressionAttributeValues = exprAttrValues
+	} else if req.Options.Concurrency == state.FirstWrite {
+		condExpr := "attribute_not_exists(etag)"
+		input.ConditionExpression = &condExpr
+	}
 
-	return e
+	_, err = d.client.PutItemWithContext(ctx, input)
+	if err != nil && haveEtag {
+		switch cErr := err.(type) {
+		case *dynamodb.ConditionalCheckFailedException:
+			err = state.NewETagError(state.ETagMismatch, cErr)
+		}
+	}
+
+	return err
 }
 
 // BulkSet performs a bulk set operation.
-func (d *StateStore) BulkSet(req []state.SetRequest) error {
+func (d *StateStore) BulkSet(ctx context.Context, req []state.SetRequest) error {
 	writeRequests := []*dynamodb.WriteRequest{}
+
+	if len(req) == 1 {
+		return d.Set(ctx, &req[0])
+	}
 
 	for _, r := range req {
 		r := r // avoid G601.
-		value, err := d.marshalToString(r.Value)
-		if err != nil {
-			return fmt.Errorf("dynamodb error: failed to set key %s: %s", r.Key, err)
-		}
-		ttl, err := d.parseTTL(&r)
-		if err != nil {
-			return fmt.Errorf("dynamodb error: failed to parse ttlInSeconds: %s", err)
+
+		if r.ETag != nil && *r.ETag != "" {
+			return fmt.Errorf("dynamodb error: BulkSet() does not support etags; please use Set() instead")
+		} else if r.Options.Concurrency == state.FirstWrite {
+			return fmt.Errorf("dynamodb error: BulkSet() does not support FirstWrite concurrency; please use Set() instead")
 		}
 
-		var item map[string]*dynamodb.AttributeValue
-		if ttl != nil {
-			item = map[string]*dynamodb.AttributeValue{
-				"key": {
-					S: aws.String(r.Key),
-				},
-				"value": {
-					S: aws.String(value),
-				},
-				d.ttlAttributeName: {
-					N: aws.String(strconv.FormatInt(*ttl, 10)),
-				},
-			}
-		} else {
-			item = map[string]*dynamodb.AttributeValue{
-				"key": {
-					S: aws.String(r.Key),
-				},
-				"value": {
-					S: aws.String(value),
-				},
-			}
+		item, err := d.getItemFromReq(&r)
+		if err != nil {
+			return err
 		}
 
 		writeRequest := &dynamodb.WriteRequest{
@@ -222,7 +222,7 @@ func (d *StateStore) BulkSet(req []state.SetRequest) error {
 	requestItems := map[string][]*dynamodb.WriteRequest{}
 	requestItems[d.table] = writeRequests
 
-	_, e := d.client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	_, e := d.client.BatchWriteItemWithContext(ctx, &dynamodb.BatchWriteItemInput{
 		RequestItems: requestItems,
 	})
 
@@ -230,29 +230,54 @@ func (d *StateStore) BulkSet(req []state.SetRequest) error {
 }
 
 // Delete performs a delete operation.
-func (d *StateStore) Delete(req *state.DeleteRequest) error {
+func (d *StateStore) Delete(ctx context.Context, req *state.DeleteRequest) error {
 	input := &dynamodb.DeleteItemInput{
 		Key: map[string]*dynamodb.AttributeValue{
-			"key": {
+			d.partitionKey: {
 				S: aws.String(req.Key),
 			},
 		},
 		TableName: aws.String(d.table),
 	}
-	_, err := d.client.DeleteItem(input)
+
+	if req.ETag != nil && *req.ETag != "" {
+		condExpr := "etag = :etag"
+		input.ConditionExpression = &condExpr
+		exprAttrValues := make(map[string]*dynamodb.AttributeValue)
+		exprAttrValues[":etag"] = &dynamodb.AttributeValue{
+			S: req.ETag,
+		}
+		input.ExpressionAttributeValues = exprAttrValues
+	}
+
+	_, err := d.client.DeleteItemWithContext(ctx, input)
+	if err != nil {
+		switch cErr := err.(type) {
+		case *dynamodb.ConditionalCheckFailedException:
+			err = state.NewETagError(state.ETagMismatch, cErr)
+		}
+	}
 
 	return err
 }
 
 // BulkDelete performs a bulk delete operation.
-func (d *StateStore) BulkDelete(req []state.DeleteRequest) error {
+func (d *StateStore) BulkDelete(ctx context.Context, req []state.DeleteRequest) error {
 	writeRequests := []*dynamodb.WriteRequest{}
 
+	if len(req) == 1 {
+		return d.Delete(ctx, &req[0])
+	}
+
 	for _, r := range req {
+		if r.ETag != nil && *r.ETag != "" {
+			return fmt.Errorf("dynamodb error: BulkDelete() does not support etags; please use Delete() instead")
+		}
+
 		writeRequest := &dynamodb.WriteRequest{
 			DeleteRequest: &dynamodb.DeleteRequest{
 				Key: map[string]*dynamodb.AttributeValue{
-					"key": {
+					d.partitionKey: {
 						S: aws.String(r.Key),
 					},
 				},
@@ -264,39 +289,86 @@ func (d *StateStore) BulkDelete(req []state.DeleteRequest) error {
 	requestItems := map[string][]*dynamodb.WriteRequest{}
 	requestItems[d.table] = writeRequests
 
-	_, e := d.client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	_, e := d.client.BatchWriteItemWithContext(ctx, &dynamodb.BatchWriteItemInput{
 		RequestItems: requestItems,
 	})
 
 	return e
 }
 
-func (d *StateStore) getDynamoDBMetadata(metadata state.Metadata) (*dynamoDBMetadata, error) {
-	b, err := json.Marshal(metadata.Properties)
-	if err != nil {
-		return nil, err
-	}
+func (d *StateStore) GetComponentMetadata() map[string]string {
+	metadataStruct := dynamoDBMetadata{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
+}
 
-	var meta dynamoDBMetadata
-	err = json.Unmarshal(b, &meta)
-	if err != nil {
-		return nil, err
-	}
-	if meta.Table == "" {
+func (d *StateStore) getDynamoDBMetadata(meta state.Metadata) (*dynamoDBMetadata, error) {
+	var m dynamoDBMetadata
+	err := metadata.DecodeMetadata(meta.Properties, &m)
+	if m.Table == "" {
 		return nil, fmt.Errorf("missing dynamodb table name")
 	}
-
-	return &meta, nil
+	m.PartitionKey = populatePartitionMetadata(meta.Properties, defaultPartitionKeyName)
+	return &m, err
 }
 
 func (d *StateStore) getClient(metadata *dynamoDBMetadata) (*dynamodb.DynamoDB, error) {
-	sess, err := aws_auth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
+	sess, err := awsAuth.GetClient(metadata.AccessKey, metadata.SecretKey, metadata.SessionToken, metadata.Region, metadata.Endpoint)
 	if err != nil {
 		return nil, err
 	}
 	c := dynamodb.New(sess)
 
 	return c, nil
+}
+
+// getItemFromReq converts a dapr state.SetRequest into an dynamodb item
+func (d *StateStore) getItemFromReq(req *state.SetRequest) (map[string]*dynamodb.AttributeValue, error) {
+	value, err := d.marshalToString(req.Value)
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb error: failed to marshal value for key %s: %s", req.Key, err)
+	}
+
+	ttl, err := d.parseTTL(req)
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb error: failed to parse ttlInSeconds: %s", err)
+	}
+
+	newEtag, err := getRand64()
+	if err != nil {
+		return nil, fmt.Errorf("dynamodb error: failed to generate etag: %w", err)
+	}
+
+	item := map[string]*dynamodb.AttributeValue{
+		d.partitionKey: {
+			S: aws.String(req.Key),
+		},
+		"value": {
+			S: aws.String(value),
+		},
+		"etag": {
+			S: aws.String(strconv.FormatUint(newEtag, 16)),
+		},
+	}
+
+	if ttl != nil {
+		item[d.ttlAttributeName] = &dynamodb.AttributeValue{
+			N: aws.String(strconv.FormatInt(*ttl, 10)),
+		}
+	}
+
+	return item, nil
+}
+
+func getRand64() (uint64, error) {
+	randBuf := make([]byte, 8)
+	_, err := rand.Read(randBuf)
+	if err != nil {
+		return 0, err
+	}
+
+	return binary.LittleEndian.Uint64(randBuf), nil
 }
 
 func (d *StateStore) marshalToString(v interface{}) (string, error) {
@@ -324,4 +396,14 @@ func (d *StateStore) parseTTL(req *state.SetRequest) (*int64, error) {
 	}
 
 	return nil, nil
+}
+
+// This is a helper to return the partition key to use.  If if metadata["partitionkey"] is present,
+// use that, otherwise use default primay key "key".
+func populatePartitionMetadata(requestMetadata map[string]string, defaultPartitionKeyName string) string {
+	if val, found := requestMetadata[metadataPartitionKey]; found {
+		return val
+	}
+
+	return defaultPartitionKeyName
 }

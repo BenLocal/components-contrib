@@ -14,20 +14,21 @@ limitations under the License.
 package sqlserver
 
 import (
+	"context"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"unicode"
 
-	"github.com/agrea/ptr"
 	mssql "github.com/denisenkom/go-mssqldb"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 // KeyType defines type of the table identifier.
@@ -79,7 +80,7 @@ const (
 )
 
 // NewSQLServerStateStore creates a new instance of a Sql Server transaction store.
-func NewSQLServerStateStore(logger logger.Logger) *SQLServer {
+func NewSQLServerStateStore(logger logger.Logger) state.Store {
 	store := SQLServer{
 		features: []state.Feature{state.FeatureETag, state.FeatureTransactional},
 		logger:   logger,
@@ -119,6 +120,16 @@ type SQLServer struct {
 	db       *sql.DB
 }
 
+type sqlServerMetadata struct {
+	ConnectionString  string
+	DatabaseName      string
+	TableName         string
+	Schema            string
+	KeyType           string
+	KeyLength         int
+	IndexedProperties string
+}
+
 func isLetterOrNumber(c rune) bool {
 	return unicode.IsNumber(c) || unicode.IsLetter(c)
 }
@@ -154,30 +165,9 @@ func isValidIndexedPropertyType(s string) bool {
 }
 
 // Init initializes the SQL server state store.
-func (s *SQLServer) Init(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[connectionStringKey]; ok && val != "" {
-		s.connectionString = val
-	} else {
-		return fmt.Errorf("missing connection string")
-	}
-
-	if err := s.getTable(metadata); err != nil {
-		return err
-	}
-
-	if err := s.getDatabase(metadata); err != nil {
-		return err
-	}
-
-	if err := s.getKeyType(metadata); err != nil {
-		return err
-	}
-
-	if err := s.getSchema(metadata); err != nil {
-		return err
-	}
-
-	if err := s.getIndexedProperties(metadata); err != nil {
+func (s *SQLServer) Init(_ context.Context, metadata state.Metadata) error {
+	err := s.parseMetadata(metadata.Properties)
+	if err != nil {
 		return err
 	}
 
@@ -202,11 +192,50 @@ func (s *SQLServer) Init(metadata state.Metadata) error {
 	return nil
 }
 
+func (s *SQLServer) parseMetadata(meta map[string]string) error {
+	m := sqlServerMetadata{
+		TableName:    defaultTable,
+		Schema:       defaultSchema,
+		DatabaseName: defaultDatabase,
+		KeyLength:    defaultKeyLength,
+	}
+	err := metadata.DecodeMetadata(meta, &m)
+	if err != nil {
+		return err
+	}
+	if m.ConnectionString == "" {
+		return fmt.Errorf("missing connection string")
+	}
+	s.connectionString = m.ConnectionString
+
+	if err := s.setTable(m.TableName); err != nil {
+		return err
+	}
+
+	if err := s.setDatabase(m.DatabaseName); err != nil {
+		return err
+	}
+
+	if err := s.setKeyType(m.KeyType, m.KeyLength); err != nil {
+		return err
+	}
+
+	if err := s.setSchema(m.Schema); err != nil {
+		return err
+	}
+
+	if err := s.setIndexedProperties(m.IndexedProperties); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // Returns validated index properties.
-func (s *SQLServer) getIndexedProperties(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[indexedPropertiesKey]; ok && val != "" {
+func (s *SQLServer) setIndexedProperties(indexedPropertiesString string) error {
+	if indexedPropertiesString != "" {
 		var indexedProperties []IndexedProperty
-		err := json.Unmarshal([]byte(val), &indexedProperties)
+		err := json.Unmarshal([]byte(indexedPropertiesString), &indexedProperties)
 		if err != nil {
 			return err
 		}
@@ -255,9 +284,9 @@ func (s *SQLServer) validateIndexedProperties(indexedProperties []IndexedPropert
 }
 
 // Validates and returns the key type.
-func (s *SQLServer) getKeyType(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[keyTypeKey]; ok && val != "" {
-		kt, err := KeyTypeFromString(val)
+func (s *SQLServer) setKeyType(keyType string, keyLength int) error {
+	if keyType != "" {
+		kt, err := KeyTypeFromString(keyType)
 		if err != nil {
 			return err
 		}
@@ -271,63 +300,43 @@ func (s *SQLServer) getKeyType(metadata state.Metadata) error {
 		return nil
 	}
 
-	if val, ok := metadata.Properties[keyLengthKey]; ok && val != "" {
-		var err error
-		s.keyLength, err = strconv.Atoi(val)
-		if err != nil {
-			return err
-		}
-
-		if s.keyLength <= 0 {
-			return fmt.Errorf("invalid key length value of %d", s.keyLength)
-		}
+	if keyLength <= 0 {
+		return fmt.Errorf("invalid key length value of %d", keyLength)
 	} else {
-		s.keyLength = defaultKeyLength
+		s.keyLength = keyLength
 	}
 
 	return nil
 }
 
 // Returns the schema name if set or the default value otherwise.
-func (s *SQLServer) getSchema(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[schemaKey]; ok && val != "" {
-		if !isValidSQLName(val) {
-			return fmt.Errorf("invalid schema name, accepted characters are (A-Z, a-z, 0-9, _)")
-		}
-		s.schema = val
-	} else {
-		s.schema = defaultSchema
+func (s *SQLServer) setSchema(schemaName string) error {
+	if !isValidSQLName(schemaName) {
+		return fmt.Errorf("invalid schema name, accepted characters are (A-Z, a-z, 0-9, _)")
 	}
+	s.schema = schemaName
 
 	return nil
 }
 
 // Returns the database name if set or the default value otherwise.
-func (s *SQLServer) getDatabase(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[databaseNameKey]; ok && val != "" {
-		if !isValidSQLName(val) {
-			return fmt.Errorf("invalid database name, accepted characters are (A-Z, a-z, 0-9, _)")
-		}
-
-		s.databaseName = val
-	} else {
-		s.databaseName = defaultDatabase
+func (s *SQLServer) setDatabase(databaseName string) error {
+	if !isValidSQLName(databaseName) {
+		return fmt.Errorf("invalid database name, accepted characters are (A-Z, a-z, 0-9, _)")
 	}
+
+	s.databaseName = databaseName
 
 	return nil
 }
 
 // Returns the table name if set or the default value otherwise.
-func (s *SQLServer) getTable(metadata state.Metadata) error {
-	if val, ok := metadata.Properties[tableNameKey]; ok && val != "" {
-		if !isValidSQLName(val) {
-			return fmt.Errorf("invalid table name, accepted characters are (A-Z, a-z, 0-9, _)")
-		}
-
-		s.tableName = val
-	} else {
-		s.tableName = defaultTable
+func (s *SQLServer) setTable(tableName string) error {
+	if !isValidSQLName(tableName) {
+		return fmt.Errorf("invalid table name, accepted characters are (A-Z, a-z, 0-9, _)")
 	}
+
+	s.tableName = tableName
 
 	return nil
 }
@@ -338,7 +347,7 @@ func (s *SQLServer) Features() []state.Feature {
 }
 
 // Multi performs multiple updates on a Sql server store.
-func (s *SQLServer) Multi(request *state.TransactionalStateRequest) error {
+func (s *SQLServer) Multi(ctx context.Context, request *state.TransactionalStateRequest) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -353,7 +362,7 @@ func (s *SQLServer) Multi(request *state.TransactionalStateRequest) error {
 				return err
 			}
 
-			err = s.executeSet(tx, &setReq)
+			err = s.executeSet(ctx, tx, &setReq)
 			if err != nil {
 				tx.Rollback()
 				return err
@@ -366,7 +375,7 @@ func (s *SQLServer) Multi(request *state.TransactionalStateRequest) error {
 				return err
 			}
 
-			err = s.executeDelete(tx, &delReq)
+			err = s.executeDelete(ctx, tx, &delReq)
 			if err != nil {
 				tx.Rollback()
 				return err
@@ -410,11 +419,11 @@ func (s *SQLServer) getDeletes(req state.TransactionalStateOperation) (state.Del
 }
 
 // Delete removes an entity from the store.
-func (s *SQLServer) Delete(req *state.DeleteRequest) error {
-	return s.executeDelete(s.db, req)
+func (s *SQLServer) Delete(ctx context.Context, req *state.DeleteRequest) error {
+	return s.executeDelete(ctx, s.db, req)
 }
 
-func (s *SQLServer) executeDelete(db dbExecutor, req *state.DeleteRequest) error {
+func (s *SQLServer) executeDelete(ctx context.Context, db dbExecutor, req *state.DeleteRequest) error {
 	var err error
 	var res sql.Result
 	if req.ETag != nil {
@@ -424,9 +433,9 @@ func (s *SQLServer) executeDelete(db dbExecutor, req *state.DeleteRequest) error
 			return state.NewETagError(state.ETagInvalid, err)
 		}
 
-		res, err = db.Exec(s.deleteWithETagCommand, sql.Named(keyColumnName, req.Key), sql.Named(rowVersionColumnName, b))
+		res, err = db.ExecContext(ctx, s.deleteWithETagCommand, sql.Named(keyColumnName, req.Key), sql.Named(rowVersionColumnName, b))
 	} else {
-		res, err = db.Exec(s.deleteWithoutETagCommand, sql.Named(keyColumnName, req.Key))
+		res, err = db.ExecContext(ctx, s.deleteWithoutETagCommand, sql.Named(keyColumnName, req.Key))
 	}
 
 	// err represents errors thrown by the stored procedure or the database itself
@@ -456,13 +465,13 @@ type TvpDeleteTableStringKey struct {
 }
 
 // BulkDelete removes multiple entries from the store.
-func (s *SQLServer) BulkDelete(req []state.DeleteRequest) error {
+func (s *SQLServer) BulkDelete(ctx context.Context, req []state.DeleteRequest) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 
-	err = s.executeBulkDelete(tx, req)
+	err = s.executeBulkDelete(ctx, tx, req)
 	if err != nil {
 		tx.Rollback()
 
@@ -474,7 +483,7 @@ func (s *SQLServer) BulkDelete(req []state.DeleteRequest) error {
 	return nil
 }
 
-func (s *SQLServer) executeBulkDelete(db dbExecutor, req []state.DeleteRequest) error {
+func (s *SQLServer) executeBulkDelete(ctx context.Context, db dbExecutor, req []state.DeleteRequest) error {
 	values := make([]TvpDeleteTableStringKey, len(req))
 	for i, d := range req {
 		var etag []byte
@@ -493,7 +502,7 @@ func (s *SQLServer) executeBulkDelete(db dbExecutor, req []state.DeleteRequest) 
 		Value:    values,
 	}
 
-	res, err := db.Exec(s.bulkDeleteCommand, sql.Named("itemsToDelete", itemsToDelete))
+	res, err := db.ExecContext(ctx, s.bulkDeleteCommand, sql.Named("itemsToDelete", itemsToDelete))
 	if err != nil {
 		return err
 	}
@@ -513,7 +522,7 @@ func (s *SQLServer) executeBulkDelete(db dbExecutor, req []state.DeleteRequest) 
 }
 
 // Get returns an entity from store.
-func (s *SQLServer) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (s *SQLServer) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	rows, err := s.db.Query(s.getCommand, sql.Named(keyColumnName, req.Key))
 	if err != nil {
 		return nil, err
@@ -540,26 +549,26 @@ func (s *SQLServer) Get(req *state.GetRequest) (*state.GetResponse, error) {
 
 	return &state.GetResponse{
 		Data: []byte(data),
-		ETag: ptr.String(etag),
+		ETag: ptr.Of(etag),
 	}, nil
 }
 
 // BulkGet performs a bulks get operations.
-func (s *SQLServer) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
+func (s *SQLServer) BulkGet(ctx context.Context, req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
 	return false, nil, nil
 }
 
 // Set adds/updates an entity on store.
-func (s *SQLServer) Set(req *state.SetRequest) error {
-	return s.executeSet(s.db, req)
+func (s *SQLServer) Set(ctx context.Context, req *state.SetRequest) error {
+	return s.executeSet(ctx, s.db, req)
 }
 
 // dbExecutor implements a common functionality implemented by db or tx.
 type dbExecutor interface {
-	Exec(query string, args ...interface{}) (sql.Result, error)
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
-func (s *SQLServer) executeSet(db dbExecutor, req *state.SetRequest) error {
+func (s *SQLServer) executeSet(ctx context.Context, db dbExecutor, req *state.SetRequest) error {
 	var err error
 	var bytes []byte
 	bytes, err = utils.Marshal(req.Value, json.Marshal)
@@ -578,9 +587,9 @@ func (s *SQLServer) executeSet(db dbExecutor, req *state.SetRequest) error {
 
 	var res sql.Result
 	if req.Options.Concurrency == state.FirstWrite {
-		res, err = db.Exec(s.upsertCommand, sql.Named(keyColumnName, req.Key), sql.Named("Data", string(bytes)), etag, sql.Named("FirstWrite", 1))
+		res, err = db.ExecContext(ctx, s.upsertCommand, sql.Named(keyColumnName, req.Key), sql.Named("Data", string(bytes)), etag, sql.Named("FirstWrite", 1))
 	} else {
-		res, err = db.Exec(s.upsertCommand, sql.Named(keyColumnName, req.Key), sql.Named("Data", string(bytes)), etag, sql.Named("FirstWrite", 0))
+		res, err = db.ExecContext(ctx, s.upsertCommand, sql.Named(keyColumnName, req.Key), sql.Named("Data", string(bytes)), etag, sql.Named("FirstWrite", 0))
 	}
 
 	if err != nil {
@@ -604,14 +613,14 @@ func (s *SQLServer) executeSet(db dbExecutor, req *state.SetRequest) error {
 }
 
 // BulkSet adds/updates multiple entities on store.
-func (s *SQLServer) BulkSet(req []state.SetRequest) error {
+func (s *SQLServer) BulkSet(ctx context.Context, req []state.SetRequest) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 
 	for i := range req {
-		err = s.executeSet(tx, &req[i])
+		err = s.executeSet(ctx, tx, &req[i])
 		if err != nil {
 			tx.Rollback()
 
@@ -622,4 +631,8 @@ func (s *SQLServer) BulkSet(req []state.SetRequest) error {
 	err = tx.Commit()
 
 	return err
+}
+
+func (s *SQLServer) GetComponentMetadata() map[string]string {
+	return map[string]string{}
 }

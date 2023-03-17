@@ -16,24 +16,30 @@ package statechange
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	r "github.com/dancannon/gorethink"
-	"github.com/pkg/errors"
 
 	"github.com/dapr/components-contrib/bindings"
+	"github.com/dapr/components-contrib/internal/utils"
 	"github.com/dapr/kit/logger"
 )
 
-// Binding represents RethinkDB change change state input binding which fires handler with
+// Binding represents RethinkDB change state input binding which fires handler with
 // both the previous and current state store content each time there is a change.
 type Binding struct {
 	logger  logger.Logger
 	session *r.Session
 	config  StateConfig
-	stopCh  chan bool
+	closed  atomic.Bool
+	closeCh chan struct{}
+	wg      sync.WaitGroup
 }
 
 // StateConfig is the binding config.
@@ -42,27 +48,25 @@ type StateConfig struct {
 	Table string `json:"table"`
 }
 
-var _ = bindings.InputBinding(&Binding{})
-
 // NewRethinkDBStateChangeBinding returns a new RethinkDB actor event input binding.
-func NewRethinkDBStateChangeBinding(logger logger.Logger) *Binding {
+func NewRethinkDBStateChangeBinding(logger logger.Logger) bindings.InputBinding {
 	return &Binding{
-		logger: logger,
-		stopCh: make(chan bool),
+		logger:  logger,
+		closeCh: make(chan struct{}),
 	}
 }
 
 // Init initializes the RethinkDB binding.
-func (b *Binding) Init(metadata bindings.Metadata) error {
+func (b *Binding) Init(ctx context.Context, metadata bindings.Metadata) error {
 	cfg, err := metadataToConfig(metadata.Properties, b.logger)
 	if err != nil {
-		return errors.Wrap(err, "unable to parse metadata properties")
+		return fmt.Errorf("unable to parse metadata properties: %w", err)
 	}
 	b.config = cfg
 
 	ses, err := r.Connect(b.config.ConnectOpts)
 	if err != nil {
-		return errors.Wrap(err, "error connecting to the database")
+		return fmt.Errorf("error connecting to the database: %w", err)
 	}
 	b.session = ses
 
@@ -70,23 +74,44 @@ func (b *Binding) Init(metadata bindings.Metadata) error {
 }
 
 // Read triggers the RethinkDB scheduler.
-func (b *Binding) Read(handler bindings.Handler) error {
-	b.logger.Infof("subscribing to state changes in %s.%s...", b.config.Database, b.config.Table)
-	cursor, err := r.DB(b.config.Database).Table(b.config.Table).Changes(r.ChangesOpts{
-		IncludeTypes: true,
-	}).Run(b.session)
-	if err != nil {
-		errors.Wrapf(err, "error connecting to table %s", b.config.Table)
+func (b *Binding) Read(ctx context.Context, handler bindings.Handler) error {
+	if b.closed.Load() {
+		return errors.New("binding is closed")
 	}
 
+	b.logger.Infof("subscribing to state changes in %s.%s...", b.config.Database, b.config.Table)
+	cursor, err := r.DB(b.config.Database).
+		Table(b.config.Table).
+		Changes(r.ChangesOpts{
+			IncludeTypes: true,
+		}).
+		Run(b.session, r.RunOpts{
+			Context: ctx,
+		})
+	if err != nil {
+		return fmt.Errorf("error connecting to table '%s': %w", b.config.Table, err)
+	}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	b.wg.Add(2)
+
 	go func() {
-		for {
+		defer b.wg.Done()
+		defer cancel()
+		select {
+		case <-b.closeCh:
+		case <-readCtx.Done():
+		}
+	}()
+
+	go func() {
+		defer b.wg.Done()
+		for readCtx.Err() == nil {
 			var change interface{}
 			ok := cursor.Next(&change)
 			if !ok {
 				b.logger.Errorf("error detecting change: %v", cursor.Err())
-
-				break
+				continue
 			}
 
 			data, err := json.Marshal(change)
@@ -104,19 +129,24 @@ func (b *Binding) Read(handler bindings.Handler) error {
 				},
 			}
 
-			if _, err := handler(context.TODO(), resp); err != nil {
+			if _, err := handler(readCtx, resp); err != nil {
 				b.logger.Errorf("error invoking change handler: %v", err)
-
 				continue
 			}
 		}
+
+		cursor.Close()
 	}()
 
-	done := <-b.stopCh
-	b.logger.Errorf("done: %b", done)
-	defer cursor.Close()
-
 	return nil
+}
+
+func (b *Binding) Close() error {
+	if b.closed.CompareAndSwap(false, true) {
+		close(b.closeCh)
+	}
+	defer b.wg.Wait()
+	return b.session.Close()
 }
 
 func metadataToConfig(cfg map[string]string, logger logger.Logger) (StateConfig, error) {
@@ -140,55 +170,47 @@ func metadataToConfig(cfg map[string]string, logger logger.Logger) (StateConfig,
 		case "timeout": // time.Duration
 			d, err := time.ParseDuration(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid timeout format: %v", v)
+				return c, fmt.Errorf("invalid timeout format: %v", v)
 			}
 			c.Timeout = d
 		case "write_timeout": // time.Duration
 			d, err := time.ParseDuration(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid write timeout format: %v", v)
+				return c, fmt.Errorf("invalid write timeout format: %v", v)
 			}
 			c.WriteTimeout = d
 		case "read_timeout": // time.Duration
 			d, err := time.ParseDuration(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid read timeout format: %v", v)
+				return c, fmt.Errorf("invalid read timeout format: %v", v)
 			}
 			c.ReadTimeout = d
 		case "keep_alive_timeout": // time.Duration
 			d, err := time.ParseDuration(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid keep alive timeout format: %v", v)
+				return c, fmt.Errorf("invalid keep alive timeout format: %v", v)
 			}
 			c.KeepAlivePeriod = d
 		case "initial_cap": // int
 			i, err := strconv.Atoi(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid keep initial cap format: %v", v)
+				return c, fmt.Errorf("invalid keep initial cap format: %v", v)
 			}
 			c.InitialCap = i
 		case "max_open": // int
 			i, err := strconv.Atoi(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid keep max open format: %v", v)
+				return c, fmt.Errorf("invalid keep max open format: %v", v)
 			}
 			c.MaxOpen = i
 		case "discover_hosts": // bool
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return c, errors.Wrapf(err, "invalid discover hosts format: %v", v)
-			}
-			c.DiscoverHosts = b
+			c.DiscoverHosts = utils.IsTruthy(v)
 		case "use-open-tracing": // bool
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return c, errors.Wrapf(err, "invalid use open tracing format: %v", v)
-			}
-			c.UseOpentracing = b
+			c.UseOpentracing = utils.IsTruthy(v)
 		case "max_idle": // int
 			i, err := strconv.Atoi(v)
 			if err != nil {
-				return c, errors.Wrapf(err, "invalid keep max idle format: %v", v)
+				return c, fmt.Errorf("invalid keep max idle format: %v", v)
 			}
 			c.InitialCap = i
 		default:

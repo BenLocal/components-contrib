@@ -20,8 +20,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-
 	rediscomponent "github.com/dapr/components-contrib/internal/component/redis"
 	"github.com/dapr/components-contrib/lock"
 	"github.com/dapr/kit/logger"
@@ -35,19 +33,16 @@ const (
 
 // Standalone Redis lock store.Any fail-over related features are not supported,such as Sentinel and Redis Cluster.
 type StandaloneRedisLock struct {
-	client         redis.UniversalClient
+	client         rediscomponent.RedisClient
 	clientSettings *rediscomponent.Settings
 	metadata       rediscomponent.Metadata
 
 	logger logger.Logger
-
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // NewStandaloneRedisLock returns a new standalone redis lock.
 // Do not use this lock with a redis cluster, which might lead to unexpected lock loss.
-func NewStandaloneRedisLock(logger logger.Logger) *StandaloneRedisLock {
+func NewStandaloneRedisLock(logger logger.Logger) lock.Store {
 	s := &StandaloneRedisLock{
 		logger: logger,
 	}
@@ -56,7 +51,7 @@ func NewStandaloneRedisLock(logger logger.Logger) *StandaloneRedisLock {
 }
 
 // Init StandaloneRedisLock.
-func (r *StandaloneRedisLock) InitLockStore(metadata lock.Metadata) error {
+func (r *StandaloneRedisLock) InitLockStore(ctx context.Context, metadata lock.Metadata) error {
 	// 1. parse config
 	m, err := rediscomponent.ParseRedisMetadata(metadata.Properties)
 	if err != nil {
@@ -77,13 +72,12 @@ func (r *StandaloneRedisLock) InitLockStore(metadata lock.Metadata) error {
 	if err != nil {
 		return err
 	}
-	r.ctx, r.cancel = context.WithCancel(context.Background())
 	// 3. connect to redis
-	if _, err = r.client.Ping(r.ctx).Result(); err != nil {
+	if _, err = r.client.PingResult(ctx); err != nil {
 		return fmt.Errorf("[standaloneRedisLock]: error connecting to redis at %s: %s", r.clientSettings.Host, err)
 	}
 	// no replica
-	replicas, err := r.getConnectedSlaves()
+	replicas, err := r.getConnectedSlaves(ctx)
 	// pass the validation if error occurs,
 	// since some redis versions such as miniredis do not recognize the `INFO` command.
 	if err == nil && replicas > 0 {
@@ -103,8 +97,8 @@ func needFailover(properties map[string]string) bool {
 	return false
 }
 
-func (r *StandaloneRedisLock) getConnectedSlaves() (int, error) {
-	res, err := r.client.Do(r.ctx, "INFO", "replication").Result()
+func (r *StandaloneRedisLock) getConnectedSlaves(ctx context.Context) (int, error) {
+	res, err := r.client.DoRead(ctx, "INFO", "replication")
 	if err != nil {
 		return 0, err
 	}
@@ -133,39 +127,34 @@ func (r *StandaloneRedisLock) parseConnectedSlaves(res string) int {
 }
 
 // Try to acquire a redis lock.
-func (r *StandaloneRedisLock) TryLock(req *lock.TryLockRequest) (*lock.TryLockResponse, error) {
+func (r *StandaloneRedisLock) TryLock(ctx context.Context, req *lock.TryLockRequest) (*lock.TryLockResponse, error) {
 	// 1.Setting redis expiration time
-	nx := r.client.SetNX(r.ctx, req.ResourceID, req.LockOwner, time.Second*time.Duration(req.ExpiryInSeconds))
-	if nx == nil {
+	nxval, err := r.client.SetNX(ctx, req.ResourceID, req.LockOwner, time.Second*time.Duration(req.ExpiryInSeconds))
+	if nxval == nil {
 		return &lock.TryLockResponse{}, fmt.Errorf("[standaloneRedisLock]: SetNX returned nil.ResourceID: %s", req.ResourceID)
 	}
 	// 2. check error
-	err := nx.Err()
 	if err != nil {
 		return &lock.TryLockResponse{}, err
 	}
 
 	return &lock.TryLockResponse{
-		Success: nx.Val(),
+		Success: *nxval,
 	}, nil
 }
 
 // Try to release a redis lock.
-func (r *StandaloneRedisLock) Unlock(req *lock.UnlockRequest) (*lock.UnlockResponse, error) {
+func (r *StandaloneRedisLock) Unlock(ctx context.Context, req *lock.UnlockRequest) (*lock.UnlockResponse, error) {
 	// 1. delegate to client.eval lua script
-	eval := r.client.Eval(r.ctx, unlockScript, []string{req.ResourceID}, req.LockOwner)
+	evalInt, parseErr, err := r.client.EvalInt(ctx, unlockScript, []string{req.ResourceID}, req.LockOwner)
 	// 2. check error
-	if eval == nil {
+	if evalInt == nil {
 		return newInternalErrorUnlockResponse(), fmt.Errorf("[standaloneRedisLock]: Eval unlock script returned nil.ResourceID: %s", req.ResourceID)
 	}
-	err := eval.Err()
-	if err != nil {
-		return newInternalErrorUnlockResponse(), err
-	}
 	// 3. parse result
-	i, err := eval.Int()
+	i := *evalInt
 	status := lock.InternalError
-	if err != nil {
+	if parseErr != nil {
 		return &lock.UnlockResponse{
 			Status: status,
 		}, err
@@ -173,9 +162,9 @@ func (r *StandaloneRedisLock) Unlock(req *lock.UnlockRequest) (*lock.UnlockRespo
 	if i >= 0 {
 		status = lock.Success
 	} else if i == -1 {
-		status = lock.LockUnexist
+		status = lock.LockDoesNotExist
 	} else if i == -2 {
-		status = lock.LockBelongToOthers
+		status = lock.LockBelongsToOthers
 	}
 	return &lock.UnlockResponse{
 		Status: status,
@@ -190,11 +179,10 @@ func newInternalErrorUnlockResponse() *lock.UnlockResponse {
 
 // Close shuts down the client's redis connections.
 func (r *StandaloneRedisLock) Close() error {
-	if r.cancel != nil {
-		r.cancel()
-	}
 	if r.client != nil {
-		return r.client.Close()
+		closeErr := r.client.Close()
+		r.client = nil
+		return closeErr
 	}
 	return nil
 }

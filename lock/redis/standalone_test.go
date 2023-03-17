@@ -14,6 +14,7 @@ limitations under the License.
 package redis
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/dapr/components-contrib/lock"
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -30,50 +32,50 @@ const resourceID = "resource_xxx"
 func TestStandaloneRedisLock_InitError(t *testing.T) {
 	t.Run("error when connection fail", func(t *testing.T) {
 		// construct component
-		comp := NewStandaloneRedisLock(logger.NewLogger("test"))
+		comp := NewStandaloneRedisLock(logger.NewLogger("test")).(*StandaloneRedisLock)
 		defer comp.Close()
 
-		cfg := lock.Metadata{
+		cfg := lock.Metadata{Base: metadata.Base{
 			Properties: make(map[string]string),
-		}
+		}}
 		cfg.Properties["redisHost"] = "127.0.0.1"
 		cfg.Properties["redisPassword"] = ""
 
 		// init
-		err := comp.InitLockStore(cfg)
+		err := comp.InitLockStore(context.Background(), cfg)
 		assert.Error(t, err)
 	})
 
 	t.Run("error when no host", func(t *testing.T) {
 		// construct component
-		comp := NewStandaloneRedisLock(logger.NewLogger("test"))
+		comp := NewStandaloneRedisLock(logger.NewLogger("test")).(*StandaloneRedisLock)
 		defer comp.Close()
 
-		cfg := lock.Metadata{
+		cfg := lock.Metadata{Base: metadata.Base{
 			Properties: make(map[string]string),
-		}
+		}}
 		cfg.Properties["redisHost"] = ""
 		cfg.Properties["redisPassword"] = ""
 
 		// init
-		err := comp.InitLockStore(cfg)
+		err := comp.InitLockStore(context.Background(), cfg)
 		assert.Error(t, err)
 	})
 
 	t.Run("error when wrong MaxRetries", func(t *testing.T) {
 		// construct component
-		comp := NewStandaloneRedisLock(logger.NewLogger("test"))
+		comp := NewStandaloneRedisLock(logger.NewLogger("test")).(*StandaloneRedisLock)
 		defer comp.Close()
 
-		cfg := lock.Metadata{
+		cfg := lock.Metadata{Base: metadata.Base{
 			Properties: make(map[string]string),
-		}
+		}}
 		cfg.Properties["redisHost"] = "127.0.0.1"
 		cfg.Properties["redisPassword"] = ""
 		cfg.Properties["maxRetries"] = "1 "
 
 		// init
-		err := comp.InitLockStore(cfg)
+		err := comp.InitLockStore(context.Background(), cfg)
 		assert.Error(t, err)
 	})
 }
@@ -85,20 +87,20 @@ func TestStandaloneRedisLock_TryLock(t *testing.T) {
 	assert.NoError(t, err)
 	defer s.Close()
 	// construct component
-	comp := NewStandaloneRedisLock(logger.NewLogger("test"))
+	comp := NewStandaloneRedisLock(logger.NewLogger("test")).(*StandaloneRedisLock)
 	defer comp.Close()
 
-	cfg := lock.Metadata{
+	cfg := lock.Metadata{Base: metadata.Base{
 		Properties: make(map[string]string),
-	}
+	}}
 	cfg.Properties["redisHost"] = s.Addr()
 	cfg.Properties["redisPassword"] = ""
 	// init
-	err = comp.InitLockStore(cfg)
+	err = comp.InitLockStore(context.Background(), cfg)
 	assert.NoError(t, err)
 	// 1. client1 trylock
 	ownerID1 := uuid.New().String()
-	resp, err := comp.TryLock(&lock.TryLockRequest{
+	resp, err := comp.TryLock(context.Background(), &lock.TryLockRequest{
 		ResourceID:      resourceID,
 		LockOwner:       ownerID1,
 		ExpiryInSeconds: 10,
@@ -110,7 +112,7 @@ func TestStandaloneRedisLock_TryLock(t *testing.T) {
 	//	2. Client2 tryLock fail
 	go func() {
 		owner2 := uuid.New().String()
-		resp2, err2 := comp.TryLock(&lock.TryLockRequest{
+		resp2, err2 := comp.TryLock(context.Background(), &lock.TryLockRequest{
 			ResourceID:      resourceID,
 			LockOwner:       owner2,
 			ExpiryInSeconds: 10,
@@ -121,7 +123,7 @@ func TestStandaloneRedisLock_TryLock(t *testing.T) {
 	}()
 	wg.Wait()
 	// 3. client 1 unlock
-	unlockResp, err := comp.Unlock(&lock.UnlockRequest{
+	unlockResp, err := comp.Unlock(context.Background(), &lock.UnlockRequest{
 		ResourceID: resourceID,
 		LockOwner:  ownerID1,
 	})
@@ -131,7 +133,7 @@ func TestStandaloneRedisLock_TryLock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		owner2 := uuid.New().String()
-		resp2, err2 := comp.TryLock(&lock.TryLockRequest{
+		resp2, err2 := comp.TryLock(context.Background(), &lock.TryLockRequest{
 			ResourceID:      resourceID,
 			LockOwner:       owner2,
 			ExpiryInSeconds: 10,
@@ -139,7 +141,7 @@ func TestStandaloneRedisLock_TryLock(t *testing.T) {
 		assert.NoError(t, err2)
 		assert.True(t, resp2.Success, "client2 failed to get lock?!")
 		// 5. client2 unlock
-		unlockResp, err := comp.Unlock(&lock.UnlockRequest{
+		unlockResp, err := comp.Unlock(context.Background(), &lock.UnlockRequest{
 			ResourceID: resourceID,
 			LockOwner:  owner2,
 		})

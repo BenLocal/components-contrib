@@ -20,6 +20,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 
@@ -64,7 +65,7 @@ type APNS struct {
 }
 
 // NewAPNS will create a new APNS output binding.
-func NewAPNS(logger logger.Logger) *APNS {
+func NewAPNS(logger logger.Logger) bindings.OutputBinding {
 	return &APNS{
 		logger: logger,
 		client: &http.Client{},
@@ -77,7 +78,7 @@ func NewAPNS(logger logger.Logger) *APNS {
 
 // Init will configure the APNS output binding using the metadata specified
 // in the binding's configuration.
-func (a *APNS) Init(metadata bindings.Metadata) error {
+func (a *APNS) Init(ctx context.Context, metadata bindings.Metadata) error {
 	if err := a.makeURLPrefix(metadata); err != nil {
 		return err
 	}
@@ -121,7 +122,11 @@ func (a *APNS) sendPushNotification(ctx context.Context, req *bindings.InvokeReq
 		return nil, err
 	}
 
-	defer httpResponse.Body.Close()
+	defer func() {
+		// Drain before closing
+		_, _ = io.Copy(io.Discard, httpResponse.Body)
+		_ = httpResponse.Body.Close()
+	}()
 
 	if httpResponse.StatusCode == http.StatusOK {
 		return makeSuccessResponse(httpResponse)

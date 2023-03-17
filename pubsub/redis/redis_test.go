@@ -20,11 +20,13 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 
+	mdata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 	"github.com/dapr/kit/logger"
+
+	internalredis "github.com/dapr/components-contrib/internal/component/redis"
 )
 
 func getFakeProperties() map[string]string {
@@ -40,7 +42,7 @@ func TestParseRedisMetadata(t *testing.T) {
 		fakeProperties := getFakeProperties()
 
 		fakeMetaData := pubsub.Metadata{
-			Properties: fakeProperties,
+			Base: mdata.Base{Properties: fakeProperties},
 		}
 
 		// act
@@ -56,7 +58,7 @@ func TestParseRedisMetadata(t *testing.T) {
 		fakeProperties := getFakeProperties()
 
 		fakeMetaData := pubsub.Metadata{
-			Properties: fakeProperties,
+			Base: mdata.Base{Properties: fakeProperties},
 		}
 		fakeMetaData.Properties[consumerID] = ""
 
@@ -94,7 +96,6 @@ func TestProcessStreams(t *testing.T) {
 
 	// act
 	testRedisStream := &redisStreams{logger: logger.NewLogger("test")}
-	testRedisStream.ctx, testRedisStream.cancel = context.WithCancel(context.Background())
 	testRedisStream.queue = make(chan redisMessageWrapper, 10)
 	go testRedisStream.worker()
 	testRedisStream.enqueueMessages(context.Background(), fakeConsumerID, fakeHandler, generateRedisStreamTestData(2, 3, expectedData))
@@ -107,9 +108,9 @@ func TestProcessStreams(t *testing.T) {
 	assert.Equal(t, 3, messageCount)
 }
 
-func generateRedisStreamTestData(topicCount, messageCount int, data string) []redis.XMessage {
-	generateXMessage := func(id int) redis.XMessage {
-		return redis.XMessage{
+func generateRedisStreamTestData(topicCount, messageCount int, data string) []internalredis.RedisXMessage {
+	generateXMessage := func(id int) internalredis.RedisXMessage {
+		return internalredis.RedisXMessage{
 			ID: fmt.Sprintf("%d", id),
 			Values: map[string]interface{}{
 				"data": data,
@@ -117,7 +118,7 @@ func generateRedisStreamTestData(topicCount, messageCount int, data string) []re
 		}
 	}
 
-	xmessageArray := make([]redis.XMessage, messageCount)
+	xmessageArray := make([]internalredis.RedisXMessage, messageCount)
 	for i := range xmessageArray {
 		xmessageArray[i] = generateXMessage(i)
 	}

@@ -15,12 +15,14 @@ package consul
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"testing"
 
 	consul "github.com/hashicorp/consul/api"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/dapr/components-contrib/metadata"
 	nr "github.com/dapr/components-contrib/nameresolution"
 	"github.com/dapr/kit/logger"
 )
@@ -90,15 +92,14 @@ func TestInit(t *testing.T) {
 	}{
 		{
 			"given no configuration don't register service just check agent",
-			nr.Metadata{
-				Properties:    getTestPropsWithoutKey(""),
-				Configuration: nil,
-			},
+			nr.Metadata{Base: metadata.Base{
+				Properties: getTestPropsWithoutKey(""),
+			}, Configuration: nil},
 			func(t *testing.T, metadata nr.Metadata) {
 				t.Helper()
 
 				var mock mockClient
-				resolver := newResolver(logger.NewLogger("test"), resolverConfig{}, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
 
 				_ = resolver.Init(metadata)
 
@@ -110,7 +111,9 @@ func TestInit(t *testing.T) {
 		{
 			"given SelfRegister true then register service",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{
+					Properties: getTestPropsWithoutKey(""),
+				},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -119,7 +122,7 @@ func TestInit(t *testing.T) {
 				t.Helper()
 
 				var mock mockClient
-				resolver := newResolver(logger.NewLogger("test"), resolverConfig{}, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
 
 				_ = resolver.Init(metadata)
 
@@ -131,7 +134,7 @@ func TestInit(t *testing.T) {
 		{
 			"given AdvancedRegistraion then register service",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: configSpec{
 					AdvancedRegistration: &consul.AgentServiceRegistration{},
 					QueryOptions:         &consul.QueryOptions{},
@@ -141,7 +144,7 @@ func TestInit(t *testing.T) {
 				t.Helper()
 
 				var mock mockClient
-				resolver := newResolver(logger.NewLogger("test"), resolverConfig{}, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
 
 				_ = resolver.Init(metadata)
 
@@ -163,7 +166,7 @@ func TestInit(t *testing.T) {
 
 func TestResolveID(t *testing.T) {
 	t.Parallel()
-	testConfig := &resolverConfig{
+	testConfig := resolverConfig{
 		DaprPortMetaKey: "DAPR_PORT",
 	}
 
@@ -184,7 +187,8 @@ func TestResolveID(t *testing.T) {
 						serviceResult: []*consul.ServiceEntry{},
 					},
 				}
-				resolver := newResolver(logger.NewLogger("test"), *testConfig, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
 
 				_, err := resolver.ResolveID(req)
 				assert.Equal(t, 1, mock.mockHealth.serviceCalled)
@@ -213,11 +217,66 @@ func TestResolveID(t *testing.T) {
 						},
 					},
 				}
-				resolver := newResolver(logger.NewLogger("test"), *testConfig, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
 
 				addr, _ := resolver.ResolveID(req)
 
 				assert.Equal(t, "123.234.345.456:50005", addr)
+			},
+		},
+		{
+			"should get random address from service",
+			nr.ResolveRequest{
+				ID: "test-app",
+			},
+			func(t *testing.T, req nr.ResolveRequest) {
+				t.Helper()
+				mock := mockClient{
+					mockHealth: mockHealth{
+						serviceResult: []*consul.ServiceEntry{
+							{
+								Service: &consul.AgentService{
+									Address: "123.234.345.456",
+									Port:    8600,
+									Meta: map[string]string{
+										"DAPR_PORT": "50005",
+									},
+								},
+							},
+							{
+								Service: &consul.AgentService{
+									Address: "234.345.456.678",
+									Port:    8600,
+									Meta: map[string]string{
+										"DAPR_PORT": "50005",
+									},
+								},
+							},
+						},
+					},
+				}
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
+
+				total1 := 0
+				total2 := 0
+				for i := 0; i < 100; i++ {
+					addr, _ := resolver.ResolveID(req)
+
+					if addr == "123.234.345.456:50005" {
+						total1++
+					} else if addr == "234.345.456.678:50005" {
+						total2++
+					} else {
+						t.Fatalf("Received unexpected address: %s", addr)
+					}
+				}
+
+				// Because of the random nature of the address being returned, we just check to make sure we get at least 20 of each (and a total of 100)
+				assert.Equal(t, 100, total1+total2)
+				assert.Greater(t, total1, 20)
+				assert.Greater(t, total2, 20)
 			},
 		},
 		{
@@ -257,7 +316,8 @@ func TestResolveID(t *testing.T) {
 						},
 					},
 				}
-				resolver := newResolver(logger.NewLogger("test"), *testConfig, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
 
 				addr, _ := resolver.ResolveID(req)
 
@@ -286,7 +346,8 @@ func TestResolveID(t *testing.T) {
 						},
 					},
 				}
-				resolver := newResolver(logger.NewLogger("test"), *testConfig, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
 
 				_, err := resolver.ResolveID(req)
 
@@ -312,7 +373,8 @@ func TestResolveID(t *testing.T) {
 						},
 					},
 				}
-				resolver := newResolver(logger.NewLogger("test"), *testConfig, &mock)
+				resolver := newResolver(logger.NewLogger("test"), &mock)
+				resolver.config = testConfig
 
 				_, err := resolver.ResolveID(req)
 
@@ -462,7 +524,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"empty configuration should only return Client, QueryOptions and DaprPortMetaKey",
 			nr.Metadata{
-				Properties:    getTestPropsWithoutKey(""),
+				Base:          metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: nil,
 			},
 			func(t *testing.T, metadata nr.Metadata) {
@@ -486,7 +548,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"empty configuration with SelfRegister should default correctly",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -503,7 +565,7 @@ func TestGetConfig(t *testing.T) {
 				assert.Equal(t, "Dapr Health Status", check.Name)
 				assert.Equal(t, "daprHealth:test-app-"+metadata.Properties[nr.HostAddress]+"-"+metadata.Properties[nr.DaprHTTPPort], check.CheckID)
 				assert.Equal(t, "15s", check.Interval)
-				assert.Equal(t, fmt.Sprintf("http://%s:%s/v1.0/healthz", metadata.Properties[nr.HostAddress], metadata.Properties[nr.DaprHTTPPort]), check.HTTP)
+				assert.Equal(t, fmt.Sprintf("http://%s/v1.0/healthz", net.JoinHostPort(metadata.Properties[nr.HostAddress], metadata.Properties[nr.DaprHTTPPort])), check.HTTP)
 
 				// Metadata
 				assert.Equal(t, 1, len(actual.Registration.Meta))
@@ -519,7 +581,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"DaprPortMetaKey should set registration meta and config used for resolve",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: configSpec{
 					SelfRegister:    true,
 					DaprPortMetaKey: "random_key",
@@ -538,7 +600,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"missing AppID property should error when SelfRegister true",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(nr.AppID),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey(nr.AppID)},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -568,7 +630,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"missing AppPort property should error when SelfRegister true",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(nr.AppPort),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey(nr.AppPort)},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -598,7 +660,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"missing HostAddress property should error when SelfRegister true",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(nr.HostAddress),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey(nr.HostAddress)},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -628,7 +690,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"missing DaprHTTPPort property should error only when SelfRegister true",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(nr.DaprHTTPPort),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey(nr.DaprHTTPPort)},
 				Configuration: configSpec{
 					SelfRegister: true,
 				},
@@ -658,7 +720,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"missing DaprPort property should always error",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(nr.DaprPort),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey(nr.DaprPort)},
 			},
 			func(t *testing.T, metadata nr.Metadata) {
 				t.Helper()
@@ -691,7 +753,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"registration should configure correctly",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: configSpec{
 					Checks: []*consul.AgentServiceCheck{
 						{
@@ -740,7 +802,7 @@ func TestGetConfig(t *testing.T) {
 		{
 			"advanced registration should override/ignore other configs",
 			nr.Metadata{
-				Properties: getTestPropsWithoutKey(""),
+				Base: metadata.Base{Properties: getTestPropsWithoutKey("")},
 				Configuration: configSpec{
 					AdvancedRegistration: &consul.AgentServiceRegistration{
 						Name:    "random-app-id",

@@ -14,6 +14,7 @@ limitations under the License.
 package jetstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -23,6 +24,7 @@ import (
 	natsserver "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats.go"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 )
 
@@ -95,11 +97,11 @@ func TestSetGetAndDelete(t *testing.T) {
 
 	store := NewJetstreamStateStore(nil)
 
-	err := store.Init(state.Metadata{
-		Properties: map[string]string{
+	err := store.Init(context.Background(), state.Metadata{
+		Base: metadata.Base{Properties: map[string]string{
 			"natsURL": nats.DefaultURL,
 			"bucket":  "test",
-		},
+		}},
 	})
 	if err != nil {
 		t.Fatalf("Could not init: %v\n", err)
@@ -111,7 +113,7 @@ func TestSetGetAndDelete(t *testing.T) {
 		"dkey": "dvalue",
 	}
 
-	err = store.Set(&state.SetRequest{
+	err = store.Set(context.Background(), &state.SetRequest{
 		Key:   tkey,
 		Value: tData,
 	})
@@ -120,7 +122,7 @@ func TestSetGetAndDelete(t *testing.T) {
 		return
 	}
 
-	resp, err := store.Get(&state.GetRequest{
+	resp, err := store.Get(context.Background(), &state.GetRequest{
 		Key: tkey,
 	})
 	if err != nil {
@@ -133,7 +135,7 @@ func TestSetGetAndDelete(t *testing.T) {
 		t.Fatal("Response data does not match written data\n")
 	}
 
-	err = store.Delete(&state.DeleteRequest{
+	err = store.Delete(context.Background(), &state.DeleteRequest{
 		Key: tkey,
 	})
 	if err != nil {
@@ -141,7 +143,7 @@ func TestSetGetAndDelete(t *testing.T) {
 		return
 	}
 
-	_, err = store.Get(&state.GetRequest{
+	_, err = store.Get(context.Background(), &state.GetRequest{
 		Key: tkey,
 	})
 	if err == nil {

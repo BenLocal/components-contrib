@@ -14,11 +14,12 @@ limitations under the License.
 package secretstores
 
 import (
-	"os"
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/components-contrib/tests/conformance/utils"
 )
@@ -44,24 +45,24 @@ func NewTestConfig(name string, allOperations bool, operations []string) TestCon
 func ConformanceTests(t *testing.T, props map[string]string, store secretstores.SecretStore, config TestConfig) {
 	// TODO add support for metadata
 	// For local env var based component test
-	os.Setenv("conftestsecret", "abcd")
-	defer os.Unsetenv("conftestsecret")
+	t.Setenv("conftestsecret", "abcd")
+	t.Setenv("secondsecret", "efgh")
 
 	// Init
 	t.Run("init", func(t *testing.T) {
-		err := store.Init(secretstores.Metadata{
-			Properties: props,
+		err := store.Init(context.Background(), secretstores.Metadata{
+			Base: metadata.Base{Properties: props},
 		})
 		assert.NoError(t, err, "expected no error on initializing store")
 	})
 
 	t.Run("ping", func(t *testing.T) {
-		err := secretstores.Ping(store)
+		err := secretstores.Ping(context.Background(), store)
 		// TODO: Ideally, all stable components should implenment ping function,
 		// so will only assert assert.Nil(t, err) finally, i.e. when current implementation
 		// implements ping in existing stable components
 		if err != nil {
-			assert.EqualError(t, err, "Ping is not implemented by this secret store")
+			assert.EqualError(t, err, "ping is not implemented by this secret store")
 		} else {
 			assert.Nil(t, err)
 		}
@@ -79,7 +80,7 @@ func ConformanceTests(t *testing.T, props map[string]string, store secretstores.
 		}
 
 		t.Run("get", func(t *testing.T) {
-			resp, err := store.GetSecret(getSecretRequest)
+			resp, err := store.GetSecret(context.Background(), getSecretRequest)
 			assert.NoError(t, err, "expected no error on getting secret %v", getSecretRequest)
 			assert.NotNil(t, resp, "expected value to be returned")
 			assert.NotNil(t, resp.Data, "expected value to be returned")
@@ -100,7 +101,7 @@ func ConformanceTests(t *testing.T, props map[string]string, store secretstores.
 		}
 
 		t.Run("bulkget", func(t *testing.T) {
-			resp, err := store.BulkGetSecret(bulkReq)
+			resp, err := store.BulkGetSecret(context.Background(), bulkReq)
 			assert.NoError(t, err, "expected no error on getting secret %v", bulkReq)
 			assert.NotNil(t, resp, "expected value to be returned")
 			assert.NotNil(t, resp.Data, "expected value to be returned")

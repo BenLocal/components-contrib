@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -54,12 +53,12 @@ type outgoingWebhook struct {
 	handler bindings.Handler
 }
 
-var webhooks = struct { // nolint: gochecknoglobals
+var webhooks = struct { //nolint:gochecknoglobals
 	sync.RWMutex
 	m map[string]*outgoingWebhook
 }{m: make(map[string]*outgoingWebhook)}
 
-func NewDingTalkWebhook(l logger.Logger) *DingTalkWebhook {
+func NewDingTalkWebhook(l logger.Logger) bindings.InputOutputBinding {
 	// See guidance on proper HTTP client settings here:
 	// https://medium.com/@nate510/don-t-use-go-s-default-http-client-4804cb19f779
 	dialer := &net.Dialer{ //nolint:exhaustivestruct
@@ -81,7 +80,7 @@ func NewDingTalkWebhook(l logger.Logger) *DingTalkWebhook {
 }
 
 // Init performs metadata parsing.
-func (t *DingTalkWebhook) Init(metadata bindings.Metadata) error {
+func (t *DingTalkWebhook) Init(_ context.Context, metadata bindings.Metadata) error {
 	var err error
 	if err = t.settings.Decode(metadata.Properties); err != nil {
 		return fmt.Errorf("dingtalk configuration error: %w", err)
@@ -94,7 +93,7 @@ func (t *DingTalkWebhook) Init(metadata bindings.Metadata) error {
 }
 
 // Read triggers the outgoing webhook, not yet production ready.
-func (t *DingTalkWebhook) Read(handler bindings.Handler) error {
+func (t *DingTalkWebhook) Read(ctx context.Context, handler bindings.Handler) error {
 	t.logger.Debugf("dingtalk webhook: start read input binding")
 
 	webhooks.Lock()
@@ -105,6 +104,13 @@ func (t *DingTalkWebhook) Read(handler bindings.Handler) error {
 	}
 	webhooks.m[t.settings.ID] = &outgoingWebhook{handler: handler}
 
+	return nil
+}
+
+func (t *DingTalkWebhook) Close() error {
+	webhooks.Lock()
+	defer webhooks.Unlock()
+	delete(webhooks.m, t.settings.ID)
 	return nil
 }
 
@@ -163,7 +169,7 @@ func (t *DingTalkWebhook) sendMessage(ctx context.Context, req *bindings.InvokeR
 	ctx, cancel := context.WithTimeout(ctx, defaultHTTPClientTimeout)
 	defer cancel()
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", postURL, bytes.NewReader(msg))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, postURL, bytes.NewReader(msg))
 	if err != nil {
 		return fmt.Errorf("dingtalk webhook error: new request failed. %w", err)
 	}
@@ -176,6 +182,8 @@ func (t *DingTalkWebhook) sendMessage(ctx context.Context, req *bindings.InvokeR
 		return fmt.Errorf("dingtalk webhook error: post failed. %w", err)
 	}
 	defer func() {
+		// Drain before closing
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
@@ -183,13 +191,8 @@ func (t *DingTalkWebhook) sendMessage(ctx context.Context, req *bindings.InvokeR
 		return fmt.Errorf("dingtalk webhook error: post failed. status:%d", resp.StatusCode)
 	}
 
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("dingtalk webhook error: read body failed. %w", err)
-	}
-
 	var rst webhookResult
-	err = json.Unmarshal(data, &rst)
+	err = json.NewDecoder(resp.Body).Decode(&rst)
 	if err != nil {
 		return fmt.Errorf("dingtalk webhook error: unmarshal body failed. %w", err)
 	}
@@ -206,7 +209,7 @@ func getPostURL(urlPath, secret string) (string, error) {
 		return urlPath, nil
 	}
 
-	timestamp := strconv.FormatInt(time.Now().Unix()*1000, 10)
+	timestamp := strconv.FormatInt(time.Now().UnixMilli(), 10)
 	sign, err := sign(secret, timestamp)
 	if err != nil {
 		return urlPath, err
@@ -222,9 +225,7 @@ func getPostURL(urlPath, secret string) (string, error) {
 func sign(secret, timestamp string) (string, error) {
 	stringToSign := fmt.Sprintf("%s\n%s", timestamp, secret)
 	h := hmac.New(sha256.New, []byte(secret))
-	if _, err := io.WriteString(h, stringToSign); err != nil {
-		return "", fmt.Errorf("sign failed. %w", err)
-	}
-
-	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+	_, _ = h.Write([]byte(stringToSign))
+	dgst := h.Sum(nil)
+	return base64.StdEncoding.EncodeToString(dgst), nil
 }

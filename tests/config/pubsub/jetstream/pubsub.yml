@@ -12,3 +12,5 @@ spec:
     value: config-test
   - name: flowControl
     value: true
+  - name: heartbeat
+    value: 5s

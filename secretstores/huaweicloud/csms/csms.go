@@ -14,22 +14,23 @@ limitations under the License.
 package csms
 
 import (
+	"context"
+	"reflect"
+
 	"github.com/huaweicloud/huaweicloud-sdk-go-v3/core/auth/basic"
 	csms "github.com/huaweicloud/huaweicloud-sdk-go-v3/services/csms/v1"
 	"github.com/huaweicloud/huaweicloud-sdk-go-v3/services/csms/v1/model"
 	csmsRegion "github.com/huaweicloud/huaweicloud-sdk-go-v3/services/csms/v1/region"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
 	"github.com/dapr/kit/logger"
 )
 
 const (
-	region          string = "region"
-	accessKey       string = "accessKey"
-	secretAccessKey string = "secretAccessKey"
-	pageLimit       string = "100"
-	latestVersion   string = "latest"
-	versionId       string = "version_id"
+	pageLimit     string = "100"
+	latestVersion string = "latest"
+	versionID     string = "version_id"
 )
 
 type csmsClient interface {
@@ -37,9 +38,17 @@ type csmsClient interface {
 	ShowSecretVersion(request *model.ShowSecretVersionRequest) (*model.ShowSecretVersionResponse, error)
 }
 
+var _ secretstores.SecretStore = (*csmsSecretStore)(nil)
+
 type csmsSecretStore struct {
 	client csmsClient
 	logger logger.Logger
+}
+
+type CsmsSecretStoreMetadata struct {
+	Region          string
+	AccessKey       string
+	SecretAccessKey string
 }
 
 // NewHuaweiCsmsSecretStore returns a new Huawei csms secret store.
@@ -48,15 +57,17 @@ func NewHuaweiCsmsSecretStore(logger logger.Logger) secretstores.SecretStore {
 }
 
 // Init creates a Huawei csms client.
-func (c *csmsSecretStore) Init(metadata secretstores.Metadata) error {
+func (c *csmsSecretStore) Init(ctx context.Context, meta secretstores.Metadata) error {
+	m := CsmsSecretStoreMetadata{}
+	metadata.DecodeMetadata(meta.Properties, &m)
 	auth := basic.NewCredentialsBuilder().
-		WithAk(metadata.Properties[accessKey]).
-		WithSk(metadata.Properties[secretAccessKey]).
+		WithAk(m.AccessKey).
+		WithSk(m.SecretAccessKey).
 		Build()
 
 	c.client = csms.NewCsmsClient(
 		csms.CsmsClientBuilder().
-			WithRegion(csmsRegion.ValueOf(metadata.Properties[region])).
+			WithRegion(csmsRegion.ValueOf(m.Region)).
 			WithCredential(auth).
 			Build())
 
@@ -64,10 +75,10 @@ func (c *csmsSecretStore) Init(metadata secretstores.Metadata) error {
 }
 
 // GetSecret retrieves a secret using a key and returns a map of decrypted string/string values.
-func (c *csmsSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (c *csmsSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	request := &model.ShowSecretVersionRequest{}
 	request.SecretName = req.Name
-	if value, ok := req.Metadata[versionId]; ok {
+	if value, ok := req.Metadata[versionID]; ok {
 		request.VersionId = value
 	}
 
@@ -84,8 +95,8 @@ func (c *csmsSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretst
 }
 
 // BulkGetSecret retrieves all secrets in the store and returns a map of decrypted string/string values.
-func (c *csmsSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
-	secretNames, err := c.getSecretNames(nil)
+func (c *csmsSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+	secretNames, err := c.getSecretNames(ctx, nil)
 	if err != nil {
 		return secretstores.BulkGetSecretResponse{}, err
 	}
@@ -95,10 +106,10 @@ func (c *csmsSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (
 	}
 
 	for _, secretName := range secretNames {
-		secret, err := c.GetSecret(secretstores.GetSecretRequest{
+		secret, err := c.GetSecret(ctx, secretstores.GetSecretRequest{
 			Name: secretName,
 			Metadata: map[string]string{
-				versionId: latestVersion,
+				versionID: latestVersion,
 			},
 		})
 		if err != nil {
@@ -112,7 +123,7 @@ func (c *csmsSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (
 }
 
 // Get all secret names recursively.
-func (c *csmsSecretStore) getSecretNames(marker *string) ([]string, error) {
+func (c *csmsSecretStore) getSecretNames(ctx context.Context, marker *string) ([]string, error) {
 	request := &model.ListSecretsRequest{}
 	limit := pageLimit
 	request.Limit = &limit
@@ -130,7 +141,7 @@ func (c *csmsSecretStore) getSecretNames(marker *string) ([]string, error) {
 
 	// If the NextMarker has value then continue to retrieve data from next page.
 	if response.PageInfo.NextMarker != nil {
-		nextResp, err := c.getSecretNames(response.PageInfo.NextMarker)
+		nextResp, err := c.getSecretNames(ctx, response.PageInfo.NextMarker)
 		if err != nil {
 			return nil, err
 		}
@@ -139,4 +150,16 @@ func (c *csmsSecretStore) getSecretNames(marker *string) ([]string, error) {
 	}
 
 	return resp, nil
+}
+
+// Features returns the features available in this secret store.
+func (c *csmsSecretStore) Features() []secretstores.Feature {
+	return []secretstores.Feature{} // No Feature supported.
+}
+
+func (c *csmsSecretStore) GetComponentMetadata() map[string]string {
+	metadataStruct := CsmsSecretStoreMetadata{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

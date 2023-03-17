@@ -14,15 +14,17 @@ limitations under the License.
 package consul
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 
-	"github.com/agrea/ptr"
 	"github.com/hashicorp/consul/api"
-	"github.com/pkg/errors"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 // Consul is a state store implementation for HashiCorp Consul.
@@ -42,7 +44,7 @@ type consulConfig struct {
 }
 
 // NewConsulStateStore returns a new consul state store.
-func NewConsulStateStore(logger logger.Logger) *Consul {
+func NewConsulStateStore(logger logger.Logger) state.Store {
 	s := &Consul{logger: logger}
 	s.DefaultBulkStore = state.NewDefaultBulkStore(s)
 
@@ -51,7 +53,7 @@ func NewConsulStateStore(logger logger.Logger) *Consul {
 
 // Init does metadata and config parsing and initializes the
 // Consul client.
-func (c *Consul) Init(metadata state.Metadata) error {
+func (c *Consul) Init(_ context.Context, metadata state.Metadata) error {
 	consulConfig, err := metadataToConfig(metadata.Properties)
 	if err != nil {
 		return fmt.Errorf("couldn't convert metadata properties: %s", err)
@@ -71,7 +73,7 @@ func (c *Consul) Init(metadata state.Metadata) error {
 
 	client, err := api.NewClient(config)
 	if err != nil {
-		return errors.Wrap(err, "initializing consul client")
+		return fmt.Errorf("initializing consul client: %w", err)
 	}
 
 	c.client = client
@@ -87,28 +89,20 @@ func (c *Consul) Features() []state.Feature {
 }
 
 func metadataToConfig(connInfo map[string]string) (*consulConfig, error) {
-	b, err := json.Marshal(connInfo)
-	if err != nil {
-		return nil, err
-	}
-
-	var config consulConfig
-	err = json.Unmarshal(b, &config)
-	if err != nil {
-		return nil, err
-	}
-
-	return &config, nil
+	m := &consulConfig{}
+	err := metadata.DecodeMetadata(connInfo, m)
+	return m, err
 }
 
 // Get retrieves a Consul KV item.
-func (c *Consul) Get(req *state.GetRequest) (*state.GetResponse, error) {
+func (c *Consul) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
 	queryOpts := &api.QueryOptions{}
 	if req.Options.Consistency == state.Strong {
 		queryOpts.RequireConsistent = true
 	}
+	queryOpts = queryOpts.WithContext(ctx)
 
-	resp, queryMeta, err := c.client.KV().Get(fmt.Sprintf("%s/%s", c.keyPrefixPath, req.Key), queryOpts)
+	resp, queryMeta, err := c.client.KV().Get(c.keyPrefixPath+"/"+req.Key, queryOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -119,12 +113,12 @@ func (c *Consul) Get(req *state.GetRequest) (*state.GetResponse, error) {
 
 	return &state.GetResponse{
 		Data: resp.Value,
-		ETag: ptr.String(queryMeta.LastContentHash),
+		ETag: ptr.Of(queryMeta.LastContentHash),
 	}, nil
 }
 
 // Set saves a Consul KV item.
-func (c *Consul) Set(req *state.SetRequest) error {
+func (c *Consul) Set(ctx context.Context, req *state.SetRequest) error {
 	var reqValByte []byte
 	b, ok := req.Value.([]byte)
 	if ok {
@@ -133,12 +127,14 @@ func (c *Consul) Set(req *state.SetRequest) error {
 		reqValByte, _ = json.Marshal(req.Value)
 	}
 
-	keyWithPath := fmt.Sprintf("%s/%s", c.keyPrefixPath, req.Key)
+	keyWithPath := c.keyPrefixPath + "/" + req.Key
 
+	writeOptions := new(api.WriteOptions)
+	writeOptions = writeOptions.WithContext(ctx)
 	_, err := c.client.KV().Put(&api.KVPair{
 		Key:   keyWithPath,
 		Value: reqValByte,
-	}, nil)
+	}, writeOptions)
 	if err != nil {
 		return fmt.Errorf("couldn't set key %s: %s", keyWithPath, err)
 	}
@@ -147,12 +143,21 @@ func (c *Consul) Set(req *state.SetRequest) error {
 }
 
 // Delete performes a Consul KV delete operation.
-func (c *Consul) Delete(req *state.DeleteRequest) error {
-	keyWithPath := fmt.Sprintf("%s/%s", c.keyPrefixPath, req.Key)
-	_, err := c.client.KV().Delete(keyWithPath, nil)
+func (c *Consul) Delete(ctx context.Context, req *state.DeleteRequest) error {
+	keyWithPath := c.keyPrefixPath + "/" + req.Key
+	writeOptions := new(api.WriteOptions)
+	writeOptions = writeOptions.WithContext(ctx)
+	_, err := c.client.KV().Delete(keyWithPath, writeOptions)
 	if err != nil {
 		return fmt.Errorf("couldn't delete key %s: %s", keyWithPath, err)
 	}
 
 	return nil
+}
+
+func (c *Consul) GetComponentMetadata() map[string]string {
+	metadataStruct := consulConfig{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

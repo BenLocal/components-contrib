@@ -15,17 +15,28 @@ package rabbitmq
 
 import (
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
+	"github.com/dapr/components-contrib/internal/utils"
+
 	amqp "github.com/rabbitmq/amqp091-go"
 
+	"github.com/dapr/kit/logger"
+
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/pubsub"
 )
 
 type metadata struct {
+	pubsub.TLSProperties
 	consumerID       string
-	host             string
+	connectionString string
+	protocol         string
+	hostname         string
+	username         string
+	password         string
 	durable          bool
 	enableDeadLetter bool
 	deleteWhenUnused bool
@@ -38,12 +49,22 @@ type metadata struct {
 	maxLenBytes      int64
 	exchangeKind     string
 	publisherConfirm bool
+	saslExternal     bool
 	concurrency      pubsub.ConcurrencyMode
+	defaultQueueTTL  *time.Duration
 }
 
 const (
-	metadataConsumerIDKey           = "consumerID"
-	metadataHostKey                 = "host"
+	metadataConsumerIDKey = "consumerID"
+
+	metadataConnectionStringKey = "connectionString"
+	metadataHostKey             = "host"
+
+	metadataProtocolKey = "protocol"
+	metadataHostnameKey = "hostname"
+	metadataUsernameKey = "username"
+	metadataPasswordKey = "password"
+
 	metadataDurableKey              = "durable"
 	metadataEnableDeadLetterKey     = "enableDeadLetter"
 	metadataDeleteWhenUnusedKey     = "deletedWhenUnused"
@@ -56,25 +77,60 @@ const (
 	metadataMaxLenBytesKey          = "maxLenBytes"
 	metadataExchangeKindKey         = "exchangeKind"
 	metadataPublisherConfirmKey     = "publisherConfirm"
+	metadataSaslExternal            = "saslExternal"
 
 	defaultReconnectWaitSeconds = 3
+
+	protocolAMQP  = "amqp"
+	protocolAMQPS = "amqps"
 )
 
 // createMetadata creates a new instance from the pubsub metadata.
-func createMetadata(pubSubMetadata pubsub.Metadata) (*metadata, error) {
+func createMetadata(pubSubMetadata pubsub.Metadata, log logger.Logger) (*metadata, error) {
 	result := metadata{
+		protocol:         protocolAMQP,
+		hostname:         "localhost",
 		durable:          true,
 		deleteWhenUnused: true,
 		autoAck:          false,
 		reconnectWait:    time.Duration(defaultReconnectWaitSeconds) * time.Second,
 		exchangeKind:     fanoutExchangeKind,
 		publisherConfirm: false,
+		saslExternal:     false,
 	}
 
-	if val, found := pubSubMetadata.Properties[metadataHostKey]; found && val != "" {
-		result.host = val
-	} else {
-		return &result, fmt.Errorf("%s missing RabbitMQ host", errorMessagePrefix)
+	if val, found := pubSubMetadata.Properties[metadataConnectionStringKey]; found && val != "" {
+		result.connectionString = val
+	} else if val, found := pubSubMetadata.Properties[metadataHostKey]; found && val != "" {
+		result.connectionString = val
+		log.Warn("[DEPRECATION NOTICE] The 'host' argument is deprecated. Use 'connectionString' or individual connection arguments instead: https://docs.dapr.io/reference/components-reference/supported-pubsub/setup-rabbitmq/")
+	}
+
+	if result.connectionString != "" {
+		uri, err := amqp.ParseURI(result.connectionString)
+		if err != nil {
+			return &result, fmt.Errorf("%s invalid connection string: %s, err: %w", errorMessagePrefix, result.connectionString, err)
+		}
+		result.protocol = uri.Scheme
+	}
+
+	if val, found := pubSubMetadata.Properties[metadataProtocolKey]; found && val != "" {
+		if result.connectionString != "" && result.protocol != val {
+			return &result, fmt.Errorf("%s protocol does not match connection string, protocol: %s, connection string: %s", errorMessagePrefix, val, result.connectionString)
+		}
+		result.protocol = val
+	}
+
+	if val, found := pubSubMetadata.Properties[metadataHostnameKey]; found && val != "" {
+		result.hostname = val
+	}
+
+	if val, found := pubSubMetadata.Properties[metadataUsernameKey]; found && val != "" {
+		result.username = val
+	}
+
+	if val, found := pubSubMetadata.Properties[metadataPasswordKey]; found && val != "" {
+		result.password = val
 	}
 
 	if val, found := pubSubMetadata.Properties[metadataConsumerIDKey]; found && val != "" {
@@ -158,6 +214,28 @@ func createMetadata(pubSubMetadata pubsub.Metadata) (*metadata, error) {
 		}
 	}
 
+	ttl, ok, err := contribMetadata.TryGetTTL(pubSubMetadata.Properties)
+	if err != nil {
+		return &result, fmt.Errorf("%s parse RabbitMQ ttl metadata with error: %s", errorMessagePrefix, err)
+	}
+
+	if ok {
+		result.defaultQueueTTL = &ttl
+	}
+
+	result.TLSProperties, err = pubsub.TLS(pubSubMetadata.Properties)
+	if err != nil {
+		return &result, fmt.Errorf("%s invalid TLS configuration: %w", errorMessagePrefix, err)
+	}
+
+	if val, found := pubSubMetadata.Properties[metadataSaslExternal]; found && val != "" {
+		boolVal := utils.IsTruthy(val)
+		if boolVal && (result.TLSProperties.CACert == "" || result.TLSProperties.ClientCert == "" || result.TLSProperties.ClientKey == "") {
+			return &result, fmt.Errorf("%s can only be set to true, when all these properties are set: %s, %s, %s", metadataSaslExternal, pubsub.CACert, pubsub.ClientCert, pubsub.ClientKey)
+		}
+		result.saslExternal = boolVal
+	}
+
 	c, err := pubsub.Concurrency(pubSubMetadata.Properties)
 	if err != nil {
 		return &result, err
@@ -183,4 +261,23 @@ func (m *metadata) formatQueueDeclareArgs(origin amqp.Table) amqp.Table {
 
 func exchangeKindValid(kind string) bool {
 	return kind == amqp.ExchangeFanout || kind == amqp.ExchangeTopic || kind == amqp.ExchangeDirect || kind == amqp.ExchangeHeaders
+}
+
+func (m *metadata) connectionURI() string {
+	if m.connectionString != "" {
+		return m.connectionString
+	}
+
+	u := url.URL{
+		Scheme: m.protocol,
+		Host:   m.hostname,
+	}
+
+	if m.username != "" && m.password != "" {
+		u.User = url.UserPassword(m.username, m.password)
+	} else if m.username != "" {
+		u.User = url.User(m.username)
+	}
+
+	return u.String()
 }

@@ -16,11 +16,11 @@ package redis
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
-	"github.com/agrea/ptr"
-	"github.com/go-redis/redis/v8"
 	jsoniter "github.com/json-iterator/go"
 
 	"github.com/dapr/components-contrib/contenttype"
@@ -30,6 +30,7 @@ import (
 	"github.com/dapr/components-contrib/state/query"
 	"github.com/dapr/components-contrib/state/utils"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 const (
@@ -91,34 +92,33 @@ const (
 // StateStore is a Redis state store.
 type StateStore struct {
 	state.DefaultBulkStore
-	client         redis.UniversalClient
-	clientSettings *rediscomponent.Settings
-	json           jsoniter.API
-	metadata       rediscomponent.Metadata
-	replicas       int
-	querySchemas   querySchemas
+	client                         rediscomponent.RedisClient
+	clientSettings                 *rediscomponent.Settings
+	json                           jsoniter.API
+	metadata                       rediscomponent.Metadata
+	replicas                       int
+	querySchemas                   querySchemas
+	suppressActorStateStoreWarning atomic.Bool
 
 	features []state.Feature
 	logger   logger.Logger
-
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // NewRedisStateStore returns a new redis state store.
-func NewRedisStateStore(logger logger.Logger) *StateStore {
+func NewRedisStateStore(logger logger.Logger) state.Store {
 	s := &StateStore{
-		json:     jsoniter.ConfigFastest,
-		features: []state.Feature{state.FeatureETag, state.FeatureTransactional, state.FeatureQueryAPI},
-		logger:   logger,
+		json:                           jsoniter.ConfigFastest,
+		features:                       []state.Feature{state.FeatureETag, state.FeatureTransactional, state.FeatureQueryAPI},
+		logger:                         logger,
+		suppressActorStateStoreWarning: atomic.Bool{},
 	}
 	s.DefaultBulkStore = state.NewDefaultBulkStore(s)
 
 	return s
 }
 
-func (r *StateStore) Ping() error {
-	if _, err := r.client.Ping(context.Background()).Result(); err != nil {
+func (r *StateStore) Ping(ctx context.Context) error {
+	if _, err := r.client.PingResult(ctx); err != nil {
 		return fmt.Errorf("redis store: error connecting to redis at %s: %s", r.clientSettings.Host, err)
 	}
 
@@ -126,7 +126,7 @@ func (r *StateStore) Ping() error {
 }
 
 // Init does metadata and connection parsing.
-func (r *StateStore) Init(metadata state.Metadata) error {
+func (r *StateStore) Init(ctx context.Context, metadata state.Metadata) error {
 	m, err := rediscomponent.ParseRedisMetadata(metadata.Properties)
 	if err != nil {
 		return err
@@ -144,17 +144,15 @@ func (r *StateStore) Init(metadata state.Metadata) error {
 		return fmt.Errorf("redis store: error parsing query index schema: %v", err)
 	}
 
-	r.ctx, r.cancel = context.WithCancel(context.Background())
-
-	if _, err = r.client.Ping(r.ctx).Result(); err != nil {
+	if _, err = r.client.PingResult(ctx); err != nil {
 		return fmt.Errorf("redis store: error connecting to redis at %s: %v", r.clientSettings.Host, err)
 	}
 
-	if r.replicas, err = r.getConnectedSlaves(); err != nil {
+	if r.replicas, err = r.getConnectedSlaves(ctx); err != nil {
 		return err
 	}
 
-	if err = r.registerSchemas(); err != nil {
+	if err = r.registerSchemas(ctx); err != nil {
 		return fmt.Errorf("redis store: error registering query schemas: %v", err)
 	}
 
@@ -166,8 +164,8 @@ func (r *StateStore) Features() []state.Feature {
 	return r.features
 }
 
-func (r *StateStore) getConnectedSlaves() (int, error) {
-	res, err := r.client.Do(r.ctx, "INFO", "replication").Result()
+func (r *StateStore) getConnectedSlaves(ctx context.Context) (int, error) {
+	res, err := r.client.DoRead(ctx, "INFO", "replication")
 	if err != nil {
 		return 0, err
 	}
@@ -195,19 +193,25 @@ func (r *StateStore) parseConnectedSlaves(res string) int {
 	return 0
 }
 
-func (r *StateStore) deleteValue(req *state.DeleteRequest) error {
+// Delete performs a delete operation.
+func (r *StateStore) Delete(ctx context.Context, req *state.DeleteRequest) error {
+	err := state.CheckRequestOptions(req.Options)
+	if err != nil {
+		return err
+	}
+
 	if req.ETag == nil {
 		etag := "0"
 		req.ETag = &etag
 	}
 
 	var delQuery string
-	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType {
+	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType && rediscomponent.ClientHasJSONSupport(r.client) {
 		delQuery = delJSONQuery
 	} else {
 		delQuery = delDefaultQuery
 	}
-	_, err := r.client.Do(r.ctx, "EVAL", delQuery, 1, req.Key, *req.ETag).Result()
+	err = r.client.DoWrite(ctx, "EVAL", delQuery, 1, req.Key, *req.ETag)
 	if err != nil {
 		return state.NewETagError(state.ETagMismatch, err)
 	}
@@ -215,18 +219,8 @@ func (r *StateStore) deleteValue(req *state.DeleteRequest) error {
 	return nil
 }
 
-// Delete performs a delete operation.
-func (r *StateStore) Delete(req *state.DeleteRequest) error {
-	err := state.CheckRequestOptions(req.Options)
-	if err != nil {
-		return err
-	}
-
-	return state.DeleteWithOptions(r.deleteValue, req)
-}
-
-func (r *StateStore) directGet(req *state.GetRequest) (*state.GetResponse, error) {
-	res, err := r.client.Do(r.ctx, "GET", req.Key).Result()
+func (r *StateStore) directGet(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
+	res, err := r.client.DoRead(ctx, "GET", req.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -242,15 +236,24 @@ func (r *StateStore) directGet(req *state.GetRequest) (*state.GetResponse, error
 	}, nil
 }
 
-func (r *StateStore) getDefault(req *state.GetRequest) (*state.GetResponse, error) {
-	res, err := r.client.Do(r.ctx, "HGETALL", req.Key).Result() // Prefer values with ETags
+func (r *StateStore) getDefault(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
+	res, err := r.client.DoRead(ctx, "HGETALL", req.Key) // Prefer values with ETags
 	if err != nil {
-		return r.directGet(req) // Falls back to original get for backward compats.
+		return r.directGet(ctx, req) // Falls back to original get for backward compats.
 	}
 	if res == nil {
 		return &state.GetResponse{}, nil
 	}
-	vals := res.([]interface{})
+	vals, ok := res.([]interface{})
+	if !ok {
+		// we retrieved a JSON value from a non-JSON store
+		valMap := res.(map[interface{}]interface{})
+		// convert valMap to []interface{}
+		vals = make([]interface{}, 0, len(valMap))
+		for k, v := range valMap {
+			vals = append(vals, k, v)
+		}
+	}
 	if len(vals) == 0 {
 		return &state.GetResponse{}, nil
 	}
@@ -266,8 +269,8 @@ func (r *StateStore) getDefault(req *state.GetRequest) (*state.GetResponse, erro
 	}, nil
 }
 
-func (r *StateStore) getJSON(req *state.GetRequest) (*state.GetResponse, error) {
-	res, err := r.client.Do(r.ctx, "JSON.GET", req.Key).Result()
+func (r *StateStore) getJSON(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
+	res, err := r.client.DoRead(ctx, "JSON.GET", req.Key)
 	if err != nil {
 		return nil, err
 	}
@@ -304,12 +307,12 @@ func (r *StateStore) getJSON(req *state.GetRequest) (*state.GetResponse, error) 
 }
 
 // Get retrieves state from redis with a key.
-func (r *StateStore) Get(req *state.GetRequest) (*state.GetResponse, error) {
-	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType {
-		return r.getJSON(req)
+func (r *StateStore) Get(ctx context.Context, req *state.GetRequest) (*state.GetResponse, error) {
+	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType && rediscomponent.ClientHasJSONSupport(r.client) {
+		return r.getJSON(ctx, req)
 	}
 
-	return r.getDefault(req)
+	return r.getDefault(ctx, req)
 }
 
 type jsonEntry struct {
@@ -317,7 +320,8 @@ type jsonEntry struct {
 	Version *int        `json:"version,omitempty"`
 }
 
-func (r *StateStore) setValue(req *state.SetRequest) error {
+// Set saves state into redis.
+func (r *StateStore) Set(ctx context.Context, req *state.SetRequest) error {
 	err := state.CheckRequestOptions(req.Options)
 	if err != nil {
 		return err
@@ -342,7 +346,7 @@ func (r *StateStore) setValue(req *state.SetRequest) error {
 
 	var bt []byte
 	var setQuery string
-	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType {
+	if contentType, ok := req.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType && rediscomponent.ClientHasJSONSupport(r.client) {
 		setQuery = setJSONQuery
 		bt, _ = utils.Marshal(&jsonEntry{Data: req.Value}, r.json.Marshal)
 	} else {
@@ -350,7 +354,7 @@ func (r *StateStore) setValue(req *state.SetRequest) error {
 		bt, _ = utils.Marshal(req.Value, r.json.Marshal)
 	}
 
-	err = r.client.Do(r.ctx, "EVAL", setQuery, 1, req.Key, ver, bt, firstWrite).Err()
+	err = r.client.DoWrite(ctx, "EVAL", setQuery, 1, req.Key, ver, bt, firstWrite)
 	if err != nil {
 		if req.ETag != nil {
 			return state.NewETagError(state.ETagMismatch, err)
@@ -360,21 +364,21 @@ func (r *StateStore) setValue(req *state.SetRequest) error {
 	}
 
 	if ttl != nil && *ttl > 0 {
-		_, err = r.client.Do(r.ctx, "EXPIRE", req.Key, *ttl).Result()
+		err = r.client.DoWrite(ctx, "EXPIRE", req.Key, *ttl)
 		if err != nil {
 			return fmt.Errorf("failed to set key %s ttl: %s", req.Key, err)
 		}
 	}
 
 	if ttl != nil && *ttl <= 0 {
-		_, err = r.client.Do(r.ctx, "PERSIST", req.Key).Result()
+		err = r.client.DoWrite(ctx, "PERSIST", req.Key)
 		if err != nil {
 			return fmt.Errorf("failed to persist key %s: %s", req.Key, err)
 		}
 	}
 
 	if req.Options.Consistency == state.Strong && r.replicas > 0 {
-		_, err = r.client.Do(r.ctx, "WAIT", r.replicas, 1000).Result()
+		err = r.client.DoWrite(ctx, "WAIT", r.replicas, 1000)
 		if err != nil {
 			return fmt.Errorf("redis waiting for %v replicas to acknowledge write, err: %s", r.replicas, err.Error())
 		}
@@ -383,16 +387,14 @@ func (r *StateStore) setValue(req *state.SetRequest) error {
 	return nil
 }
 
-// Set saves state into redis.
-func (r *StateStore) Set(req *state.SetRequest) error {
-	return state.SetWithOptions(r.setValue, req)
-}
-
 // Multi performs a transactional operation. succeeds only if all operations succeed, and fails if one or more operations fail.
-func (r *StateStore) Multi(request *state.TransactionalStateRequest) error {
+func (r *StateStore) Multi(ctx context.Context, request *state.TransactionalStateRequest) error {
+	if r.suppressActorStateStoreWarning.CompareAndSwap(false, true) {
+		r.logger.Warn("Redis does not support transaction rollbacks and should not be used in production as an actor state store.")
+	}
 	var setQuery, delQuery string
 	var isJSON bool
-	if contentType, ok := request.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType {
+	if contentType, ok := request.Metadata[daprmetadata.ContentType]; ok && contentType == contenttype.JSONContentType && rediscomponent.ClientHasJSONSupport(r.client) {
 		isJSON = true
 		setQuery = setJSONQuery
 		delQuery = delJSONQuery
@@ -423,12 +425,12 @@ func (r *StateStore) Multi(request *state.TransactionalStateRequest) error {
 			} else {
 				bt, _ = utils.Marshal(req.Value, r.json.Marshal)
 			}
-			pipe.Do(r.ctx, "EVAL", setQuery, 1, req.Key, ver, bt)
+			pipe.Do(ctx, "EVAL", setQuery, 1, req.Key, ver, bt)
 			if ttl != nil && *ttl > 0 {
-				pipe.Do(r.ctx, "EXPIRE", req.Key, *ttl)
+				pipe.Do(ctx, "EXPIRE", req.Key, *ttl)
 			}
 			if ttl != nil && *ttl <= 0 {
-				pipe.Do(r.ctx, "PERSIST", req.Key)
+				pipe.Do(ctx, "PERSIST", req.Key)
 			}
 		} else if o.Operation == state.Delete {
 			req := o.Request.(state.DeleteRequest)
@@ -436,27 +438,27 @@ func (r *StateStore) Multi(request *state.TransactionalStateRequest) error {
 				etag := "0"
 				req.ETag = &etag
 			}
-			pipe.Do(r.ctx, "EVAL", delQuery, 1, req.Key, *req.ETag)
+			pipe.Do(ctx, "EVAL", delQuery, 1, req.Key, *req.ETag)
 		}
 	}
 
-	_, err := pipe.Exec(r.ctx)
+	err := pipe.Exec(ctx)
 
 	return err
 }
 
-func (r *StateStore) registerSchemas() error {
+func (r *StateStore) registerSchemas(ctx context.Context) error {
 	for name, elem := range r.querySchemas {
 		r.logger.Infof("redis: create query index %s", name)
-		if err := r.client.Do(r.ctx, elem.schema...).Err(); err != nil {
+		if err := r.client.DoWrite(ctx, elem.schema...); err != nil {
 			if err.Error() != "Index already exists" {
 				return err
 			}
 			r.logger.Infof("redis: drop stale query index %s", name)
-			if err = r.client.Do(r.ctx, "FT.DROPINDEX", name).Err(); err != nil {
+			if err = r.client.DoWrite(ctx, "FT.DROPINDEX", name); err != nil {
 				return err
 			}
-			if err = r.client.Do(r.ctx, elem.schema...).Err(); err != nil {
+			if err = r.client.DoWrite(ctx, elem.schema...); err != nil {
 				return err
 			}
 		}
@@ -476,7 +478,7 @@ func (r *StateStore) getKeyVersion(vals []interface{}) (data string, version *st
 			seenData = true
 		case "version":
 			versionVal, _ := strconv.Unquote(fmt.Sprintf("%q", vals[i+1]))
-			version = ptr.String(versionVal)
+			version = ptr.Of(versionVal)
 			seenVersion = true
 		}
 	}
@@ -514,7 +516,10 @@ func (r *StateStore) parseTTL(req *state.SetRequest) (*int, error) {
 }
 
 // Query executes a query against store.
-func (r *StateStore) Query(req *state.QueryRequest) (*state.QueryResponse, error) {
+func (r *StateStore) Query(ctx context.Context, req *state.QueryRequest) (*state.QueryResponse, error) {
+	if !rediscomponent.ClientHasJSONSupport(r.client) {
+		return nil, fmt.Errorf("redis-json server support is required for query capability")
+	}
 	indexName, ok := daprmetadata.TryGetQueryIndexName(req.Metadata)
 	if !ok {
 		return nil, fmt.Errorf("query index not found")
@@ -529,7 +534,7 @@ func (r *StateStore) Query(req *state.QueryRequest) (*state.QueryResponse, error
 	if err := qbuilder.BuildQuery(&req.Query); err != nil {
 		return &state.QueryResponse{}, err
 	}
-	data, token, err := q.execute(r.ctx, r.client)
+	data, token, err := q.execute(ctx, r.client)
 	if err != nil {
 		return &state.QueryResponse{}, err
 	}
@@ -541,7 +546,12 @@ func (r *StateStore) Query(req *state.QueryRequest) (*state.QueryResponse, error
 }
 
 func (r *StateStore) Close() error {
-	r.cancel()
-
 	return r.client.Close()
+}
+
+func (r *StateStore) GetComponentMetadata() map[string]string {
+	metadataStruct := rediscomponent.Settings{}
+	metadataInfo := map[string]string{}
+	daprmetadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }

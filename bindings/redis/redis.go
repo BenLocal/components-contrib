@@ -18,38 +18,37 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/go-redis/redis/v8"
-
 	"github.com/dapr/components-contrib/bindings"
 	rediscomponent "github.com/dapr/components-contrib/internal/component/redis"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
 // Redis is a redis output binding.
 type Redis struct {
-	client         redis.UniversalClient
+	client         rediscomponent.RedisClient
 	clientSettings *rediscomponent.Settings
 	logger         logger.Logger
-
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
+const (
+	// IncrementOperation is the operation to increment a key.
+	IncrementOperation bindings.OperationKind = "increment"
+)
+
 // NewRedis returns a new redis bindings instance.
-func NewRedis(logger logger.Logger) *Redis {
+func NewRedis(logger logger.Logger) bindings.OutputBinding {
 	return &Redis{logger: logger}
 }
 
 // Init performs metadata parsing and connection creation.
-func (r *Redis) Init(meta bindings.Metadata) (err error) {
+func (r *Redis) Init(ctx context.Context, meta bindings.Metadata) (err error) {
 	r.client, r.clientSettings, err = rediscomponent.ParseClientFromProperties(meta.Properties, nil)
 	if err != nil {
 		return err
 	}
 
-	r.ctx, r.cancel = context.WithCancel(context.Background())
-
-	_, err = r.client.Ping(r.ctx).Result()
+	_, err = r.client.PingResult(ctx)
 	if err != nil {
 		return fmt.Errorf("redis binding: error connecting to redis at %s: %s", r.clientSettings.Host, err)
 	}
@@ -57,8 +56,8 @@ func (r *Redis) Init(meta bindings.Metadata) (err error) {
 	return err
 }
 
-func (r *Redis) Ping() error {
-	if _, err := r.client.Ping(context.Background()).Result(); err != nil {
+func (r *Redis) Ping(ctx context.Context) error {
+	if _, err := r.client.PingResult(ctx); err != nil {
 		return fmt.Errorf("redis binding: error connecting to redis at %s: %s", r.clientSettings.Host, err)
 	}
 
@@ -66,25 +65,80 @@ func (r *Redis) Ping() error {
 }
 
 func (r *Redis) Operations() []bindings.OperationKind {
-	return []bindings.OperationKind{bindings.CreateOperation}
+	return []bindings.OperationKind{
+		bindings.CreateOperation,
+		bindings.DeleteOperation,
+		bindings.GetOperation,
+		IncrementOperation,
+	}
+}
+
+func (r *Redis) expireKeyIfRequested(ctx context.Context, requestMetadata map[string]string, key string) error {
+	// get ttl from request metadata
+	ttl, ok, err := contribMetadata.TryGetTTL(requestMetadata)
+	if err != nil {
+		return err
+	}
+	if ok {
+		errExpire := r.client.DoWrite(ctx, "EXPIRE", key, int(ttl.Seconds()))
+		if errExpire != nil {
+			return errExpire
+		}
+	}
+	return nil
 }
 
 func (r *Redis) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bindings.InvokeResponse, error) {
-	if val, ok := req.Metadata["key"]; ok && val != "" {
-		key := val
-		_, err := r.client.Do(ctx, "SET", key, req.Data).Result()
-		if err != nil {
-			return nil, err
+	if key, ok := req.Metadata["key"]; ok && key != "" {
+		switch req.Operation {
+		case bindings.DeleteOperation:
+			err := r.client.Del(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+		case bindings.GetOperation:
+			var data string
+			var err error
+			if req.Metadata["delete"] == "true" {
+				data, err = r.client.GetDel(ctx, key)
+			} else {
+				data, err = r.client.Get(ctx, key)
+			}
+			if err != nil {
+				if err.Error() == "redis: nil" {
+					return &bindings.InvokeResponse{}, nil
+				}
+				return nil, err
+			}
+			rep := &bindings.InvokeResponse{}
+			rep.Data = []byte(data)
+			return rep, nil
+		case bindings.CreateOperation:
+			err := r.client.DoWrite(ctx, "SET", key, req.Data)
+			if err != nil {
+				return nil, err
+			}
+			err = r.expireKeyIfRequested(ctx, req.Metadata, key)
+			if err != nil {
+				return nil, err
+			}
+		case IncrementOperation:
+			err := r.client.DoWrite(ctx, "INCR", key)
+			if err != nil {
+				return nil, err
+			}
+			err = r.expireKeyIfRequested(ctx, req.Metadata, key)
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("invalid operation type: %s", req.Operation)
 		}
-
 		return nil, nil
 	}
-
-	return nil, errors.New("redis binding: missing key on write request metadata")
+	return nil, errors.New("redis binding: missing key in request metadata")
 }
 
 func (r *Redis) Close() error {
-	r.cancel()
-
 	return r.client.Close()
 }

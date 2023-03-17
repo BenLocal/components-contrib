@@ -35,8 +35,9 @@ type (
 	}
 
 	Sidecar struct {
-		appID   string
-		options []interface{}
+		appID                    string
+		options                  []interface{}
+		gracefulShutdownDuration time.Duration
 	}
 
 	ClientCallback func(client *Client)
@@ -80,7 +81,7 @@ func (s Sidecar) ToStep() (string, flow.Runnable, flow.Runnable) {
 }
 
 func Start(appID string, options ...interface{}) flow.Runnable {
-	return Sidecar{appID, options}.Start
+	return Sidecar{appID, options, 0}.Start
 }
 
 func (s Sidecar) Start(ctx flow.Context) error {
@@ -92,12 +93,14 @@ func (s Sidecar) Start(ctx flow.Context) error {
 	opts = append(opts, rtembedded.CommonComponents(logContrib)...)
 
 	for _, o := range s.options {
-		if rto, ok := o.(rtembedded.Option); ok {
-			rtoptions = append(rtoptions, rto)
+		if rteo, ok := o.(rtembedded.Option); ok {
+			rtoptions = append(rtoptions, rteo)
 		} else if rto, ok := o.(runtime.Option); ok {
 			opts = append(opts, rto)
-		} else if rto, ok := o.(Option); ok {
-			rto(&options)
+		} else if rtos, ok := o.([]runtime.Option); ok {
+			opts = append(opts, rtos...)
+		} else if op, ok := o.(Option); ok {
+			op(&options)
 		}
 	}
 
@@ -105,6 +108,7 @@ func (s Sidecar) Start(ctx flow.Context) error {
 	if err != nil {
 		return err
 	}
+	s.gracefulShutdownDuration = rtConf.GracefulShutdownDuration
 
 	client := Client{
 		rt: rt,
@@ -143,7 +147,8 @@ func Stop(appID string) flow.Runnable {
 func (s Sidecar) Stop(ctx flow.Context) error {
 	var client *Client
 	if ctx.Get(s.appID, &client) {
-		client.rt.Shutdown(2 * time.Second)
+		client.rt.SetRunning(true)
+		client.rt.Shutdown(s.gracefulShutdownDuration)
 
 		return client.rt.WaitUntilShutdown()
 	}

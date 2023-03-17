@@ -43,7 +43,7 @@ type postmarkMetadata struct {
 }
 
 // NewPostmark returns a new Postmark bindings instance.
-func NewPostmark(logger logger.Logger) *Postmark {
+func NewPostmark(logger logger.Logger) bindings.OutputBinding {
 	return &Postmark{logger: logger}
 }
 
@@ -74,7 +74,7 @@ func (p *Postmark) parseMetadata(meta bindings.Metadata) (postmarkMetadata, erro
 }
 
 // Init does metadata parsing and not much else :).
-func (p *Postmark) Init(metadata bindings.Metadata) error {
+func (p *Postmark) Init(_ context.Context, metadata bindings.Metadata) error {
 	// Parse input metadata
 	meta, err := p.parseMetadata(metadata)
 	if err != nil {
@@ -154,7 +154,7 @@ func (p *Postmark) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bi
 
 	// Send the email
 	client := postmark.NewClient(p.metadata.ServerToken, p.metadata.AccountToken)
-	_, err := client.SendEmail(email)
+	_, err := client.SendEmail(ctx, email)
 	if err != nil {
 		return nil, fmt.Errorf("error from Postmark, sending email failed: %+v", err)
 	}

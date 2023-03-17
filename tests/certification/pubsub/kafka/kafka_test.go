@@ -15,9 +15,7 @@ package kafka_test
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
-	"net/http"
 	"testing"
 	"time"
 
@@ -29,7 +27,6 @@ import (
 
 	// Pub/Sub.
 
-	"github.com/dapr/components-contrib/pubsub"
 	pubsub_kafka "github.com/dapr/components-contrib/pubsub/kafka"
 	pubsub_loader "github.com/dapr/dapr/pkg/components/pubsub"
 
@@ -70,17 +67,9 @@ const (
 	topicName  = "neworder"
 )
 
-var (
-	brokers          = []string{"localhost:19092", "localhost:29092", "localhost:39092"}
-	oauthClientQuery = "https://localhost:4444/clients/dapr"
-)
+var brokers = []string{"localhost:19092", "localhost:29092", "localhost:39092"}
 
 func TestKafka(t *testing.T) {
-	log := logger.NewLogger("dapr.components")
-	component := pubsub_loader.New("kafka", func() pubsub.PubSub {
-		return pubsub_kafka.NewKafka(log)
-	})
-
 	// For Kafka, we should ensure messages are received in order.
 	consumerGroup1 := watcher.NewOrdered()
 	// This watcher is across multiple consumers in the same group
@@ -248,24 +237,6 @@ func TestKafka(t *testing.T) {
 
 			return err
 		})).
-		Step("wait for Dapr OAuth client", retry.Do(20*time.Second, 6, func(ctx flow.Context) error {
-			httpClient := &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{
-						InsecureSkipVerify: true, // test server certificate is not trusted.
-					},
-				},
-			}
-
-			resp, err := httpClient.Get(oauthClientQuery)
-			if err != nil {
-				return err
-			}
-			if resp.StatusCode != 200 {
-				return fmt.Errorf("oauth client query for 'dapr' not successful")
-			}
-			return nil
-		})).
 		//
 		// Run the application logic above.
 		Step(app.Run(appID1, fmt.Sprintf(":%d", appPort),
@@ -277,7 +248,8 @@ func TestKafka(t *testing.T) {
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort),
-			runtime.WithPubSubs(component))).
+			componentRuntimeOptions(),
+		)).
 		//
 		// Run the second application.
 		Step(app.Run(appID2, fmt.Sprintf(":%d", appPort+portOffset),
@@ -285,12 +257,13 @@ func TestKafka(t *testing.T) {
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName2,
-			embedded.WithComponentsPath("./components/mtls-consumer"),
+			embedded.WithComponentsPath("./components/consumer2"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset),
-			runtime.WithPubSubs(component))).
+			componentRuntimeOptions(),
+		)).
 		//
 		// Send messages using the same metadata/message key so we can expect
 		// in-order processing.
@@ -302,12 +275,13 @@ func TestKafka(t *testing.T) {
 		//
 		// Run the Dapr sidecar with the Kafka component.
 		Step(sidecar.Run(sidecarName3,
-			embedded.WithComponentsPath("./components/oauth-consumer"),
+			embedded.WithComponentsPath("./components/consumer2"),
 			embedded.WithAppProtocol(runtime.HTTPProtocol, appPort+portOffset*2),
 			embedded.WithDaprGRPCPort(runtime.DefaultDaprAPIGRPCPort+portOffset*2),
 			embedded.WithDaprHTTPPort(runtime.DefaultDaprHTTPPort+portOffset*2),
 			embedded.WithProfilePort(runtime.DefaultProfilePort+portOffset*2),
-			runtime.WithPubSubs(component))).
+			componentRuntimeOptions(),
+		)).
 		Step("reset", flow.Reset(consumerGroup2)).
 		//
 		// Send messages with random keys to test message consumption
@@ -365,4 +339,16 @@ func TestKafka(t *testing.T) {
 		Step("wait", flow.Sleep(30*time.Second)).
 		Step("assert messages(consumer rebalance)", assertMessages(consumerGroup2)).
 		Run()
+}
+
+func componentRuntimeOptions() []runtime.Option {
+	log := logger.NewLogger("dapr.components")
+
+	pubsubRegistry := pubsub_loader.NewRegistry()
+	pubsubRegistry.Logger = log
+	pubsubRegistry.RegisterComponent(pubsub_kafka.NewKafka, "kafka")
+
+	return []runtime.Option{
+		runtime.WithPubSubs(pubsubRegistry),
+	}
 }

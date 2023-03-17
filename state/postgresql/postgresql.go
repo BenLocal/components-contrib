@@ -14,90 +14,49 @@ limitations under the License.
 package postgresql
 
 import (
+	"github.com/dapr/components-contrib/internal/component/postgresql"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
 )
 
-// PostgreSQL state store.
-type PostgreSQL struct {
-	features []state.Feature
-	logger   logger.Logger
-	dbaccess dbAccess
-}
-
 // NewPostgreSQLStateStore creates a new instance of PostgreSQL state store.
-func NewPostgreSQLStateStore(logger logger.Logger) *PostgreSQL {
-	dba := newPostgresDBAccess(logger)
+func NewPostgreSQLStateStore(logger logger.Logger) state.Store {
+	return postgresql.NewPostgreSQLStateStore(logger, postgresql.Options{
+		ETagColumn: "xmin",
+		MigrateFn:  performMigration,
+		SetQueryFn: func(req *state.SetRequest, opts postgresql.SetQueryOptions) string {
+			// Sprintf is required for table name because sql.DB does not
+			// substitute parameters for table names.
+			// Other parameters use sql.DB parameter substitution.
+			if req.ETag == nil || *req.ETag == "" {
+				if req.Options.Concurrency == state.FirstWrite {
+					return `INSERT INTO ` + opts.TableName + `
+					(key, value, isbinary, expiredate)
+				VALUES
+					($1, $2, $3, ` + opts.ExpireDateValue + `);`
+				}
 
-	return newPostgreSQLStateStore(logger, dba)
-}
+				return `INSERT INTO ` + opts.TableName + `
+					(key, value, isbinary, expiredate)
+				VALUES
+					($1, $2, $3, ` + opts.ExpireDateValue + `)
+				ON CONFLICT (key)
+				DO UPDATE SET
+					value = $2,
+					isbinary = $3,
+					updatedate = CURRENT_TIMESTAMP,
+					expiredate = ` + opts.ExpireDateValue + `;`
+			}
 
-// newPostgreSQLStateStore creates a newPostgreSQLStateStore instance of a PostgreSQL state store.
-// This unexported constructor allows injecting a dbAccess instance for unit testing.
-func newPostgreSQLStateStore(logger logger.Logger, dba dbAccess) *PostgreSQL {
-	return &PostgreSQL{
-		features: []state.Feature{state.FeatureETag, state.FeatureTransactional, state.FeatureQueryAPI},
-		logger:   logger,
-		dbaccess: dba,
-	}
-}
-
-// Init initializes the SQL server state store.
-func (p *PostgreSQL) Init(metadata state.Metadata) error {
-	return p.dbaccess.Init(metadata)
-}
-
-// Features returns the features available in this state store.
-func (p *PostgreSQL) Features() []state.Feature {
-	return p.features
-}
-
-// Delete removes an entity from the store.
-func (p *PostgreSQL) Delete(req *state.DeleteRequest) error {
-	return p.dbaccess.Delete(req)
-}
-
-// BulkDelete removes multiple entries from the store.
-func (p *PostgreSQL) BulkDelete(req []state.DeleteRequest) error {
-	return p.dbaccess.BulkDelete(req)
-}
-
-// Get returns an entity from store.
-func (p *PostgreSQL) Get(req *state.GetRequest) (*state.GetResponse, error) {
-	return p.dbaccess.Get(req)
-}
-
-// BulkGet performs a bulks get operations.
-func (p *PostgreSQL) BulkGet(req []state.GetRequest) (bool, []state.BulkGetResponse, error) {
-	// TODO: replace with ExecuteMulti for performance
-	return false, nil, nil
-}
-
-// Set adds/updates an entity on store.
-func (p *PostgreSQL) Set(req *state.SetRequest) error {
-	return p.dbaccess.Set(req)
-}
-
-// BulkSet adds/updates multiple entities on store.
-func (p *PostgreSQL) BulkSet(req []state.SetRequest) error {
-	return p.dbaccess.BulkSet(req)
-}
-
-// Multi handles multiple transactions. Implements TransactionalStore.
-func (p *PostgreSQL) Multi(request *state.TransactionalStateRequest) error {
-	return p.dbaccess.ExecuteMulti(request)
-}
-
-// Query executes a query against store.
-func (p *PostgreSQL) Query(req *state.QueryRequest) (*state.QueryResponse, error) {
-	return p.dbaccess.Query(req)
-}
-
-// Close implements io.Closer.
-func (p *PostgreSQL) Close() error {
-	if p.dbaccess != nil {
-		return p.dbaccess.Close()
-	}
-
-	return nil
+			return `UPDATE ` + opts.TableName + `
+			SET
+				value = $2,
+				isbinary = $3,
+				updatedate = CURRENT_TIMESTAMP,
+				expiredate = ` + opts.ExpireDateValue + `
+			WHERE
+				key = $1
+				AND xmin = $4;`
+		},
+	})
 }

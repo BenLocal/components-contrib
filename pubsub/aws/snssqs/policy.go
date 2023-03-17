@@ -18,7 +18,7 @@ type arnEquals struct {
 }
 
 type condition struct {
-	ArnEquals arnEquals
+	ValueArnEquals arnEquals `json:"ArnEquals"`
 }
 
 type principal struct {
@@ -38,20 +38,28 @@ type policy struct {
 	Statement []statement
 }
 
-func (p *policy) statementExists(other *statement) bool {
+func (p *policy) tryInsertCondition(sqsArn string, snsArn string) bool {
 	for _, s := range p.Statement {
-		if s.Effect == other.Effect &&
-			s.Principal.Service == other.Principal.Service &&
-			s.Action == other.Action &&
-			s.Resource == other.Resource &&
-			s.Condition.ArnEquals.AwsSourceArn == other.Condition.ArnEquals.AwsSourceArn {
-			return true
+		// if there is a statement for sqsArn
+		if s.Resource == sqsArn {
+			// check if the snsArn already exists then return true
+			if s.Condition.ValueArnEquals.AwsSourceArn == snsArn {
+				return true
+			}
 		}
 	}
-
+	// insert a new statement if no statement for the sqsArn or is new sns subscriber
+	newStatement := &statement{
+		Effect:    "Allow",
+		Principal: principal{Service: "sns.amazonaws.com"},
+		Action:    "sqs:SendMessage",
+		Resource:  sqsArn,
+		Condition: condition{
+			ValueArnEquals: arnEquals{
+				AwsSourceArn: snsArn,
+			},
+		},
+	}
+	p.Statement = append(p.Statement, *newStatement)
 	return false
-}
-
-func (p *policy) addStatement(other *statement) {
-	p.Statement = append(p.Statement, *other)
 }

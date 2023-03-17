@@ -19,12 +19,15 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/dapr/components-contrib/bindings"
-	contrib_metadata "github.com/dapr/components-contrib/metadata"
+	"github.com/dapr/components-contrib/internal/utils"
+	contribMetadata "github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/kit/logger"
 )
 
@@ -49,6 +52,9 @@ type RabbitMQ struct {
 	metadata   rabbitMQMetadata
 	logger     logger.Logger
 	queue      amqp.Queue
+	closed     atomic.Bool
+	closeCh    chan struct{}
+	wg         sync.WaitGroup
 }
 
 // Metadata is the rabbitmq config.
@@ -64,12 +70,15 @@ type rabbitMQMetadata struct {
 }
 
 // NewRabbitMQ returns a new rabbitmq instance.
-func NewRabbitMQ(logger logger.Logger) *RabbitMQ {
-	return &RabbitMQ{logger: logger}
+func NewRabbitMQ(logger logger.Logger) bindings.InputOutputBinding {
+	return &RabbitMQ{
+		logger:  logger,
+		closeCh: make(chan struct{}),
+	}
 }
 
 // Init does metadata parsing and connection creation.
-func (r *RabbitMQ) Init(metadata bindings.Metadata) error {
+func (r *RabbitMQ) Init(_ context.Context, metadata bindings.Metadata) error {
 	err := r.parseMetadata(metadata)
 	if err != nil {
 		return err
@@ -109,13 +118,13 @@ func (r *RabbitMQ) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bi
 		Body:         req.Data,
 	}
 
-	contentType, ok := contrib_metadata.TryGetContentType(req.Metadata)
+	contentType, ok := contribMetadata.TryGetContentType(req.Metadata)
 
 	if ok {
 		pub.ContentType = contentType
 	}
 
-	ttl, ok, err := contrib_metadata.TryGetTTL(req.Metadata)
+	ttl, ok, err := contribMetadata.TryGetTTL(req.Metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +136,7 @@ func (r *RabbitMQ) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bi
 		pub.Expiration = strconv.FormatInt(ttl.Milliseconds(), 10)
 	}
 
-	priority, ok, err := contrib_metadata.TryGetPriority(req.Metadata)
+	priority, ok, err := contribMetadata.TryGetPriority(req.Metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +145,7 @@ func (r *RabbitMQ) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*bi
 		pub.Priority = priority
 	}
 
-	err = r.channel.Publish("", r.metadata.QueueName, false, false, pub)
+	err = r.channel.PublishWithContext(ctx, "", r.metadata.QueueName, false, false, pub)
 
 	if err != nil {
 		return nil, err
@@ -161,19 +170,11 @@ func (r *RabbitMQ) parseMetadata(metadata bindings.Metadata) error {
 	}
 
 	if val, ok := metadata.Properties[durable]; ok && val != "" {
-		d, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("rabbitMQ binding error: can't parse durable field: %s", err)
-		}
-		m.Durable = d
+		m.Durable = utils.IsTruthy(val)
 	}
 
 	if val, ok := metadata.Properties[deleteWhenUnused]; ok && val != "" {
-		d, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("rabbitMQ binding error: can't parse deleteWhenUnused field: %s", err)
-		}
-		m.DeleteWhenUnused = d
+		m.DeleteWhenUnused = utils.IsTruthy(val)
 	}
 
 	if val, ok := metadata.Properties[prefetchCount]; ok && val != "" {
@@ -185,11 +186,7 @@ func (r *RabbitMQ) parseMetadata(metadata bindings.Metadata) error {
 	}
 
 	if val, ok := metadata.Properties[exclusive]; ok && val != "" {
-		d, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("rabbitMQ binding error: can't parse exclusive field: %s", err)
-		}
-		m.Exclusive = d
+		m.Exclusive = utils.IsTruthy(val)
 	}
 
 	if val, ok := metadata.Properties[maxPriority]; ok && val != "" {
@@ -207,7 +204,7 @@ func (r *RabbitMQ) parseMetadata(metadata bindings.Metadata) error {
 		m.MaxPriority = &maxPriority
 	}
 
-	ttl, ok, err := contrib_metadata.TryGetTTL(metadata.Properties)
+	ttl, ok, err := contribMetadata.TryGetTTL(metadata.Properties)
 	if err != nil {
 		return err
 	}
@@ -236,7 +233,11 @@ func (r *RabbitMQ) declareQueue() (amqp.Queue, error) {
 	return r.channel.QueueDeclare(r.metadata.QueueName, r.metadata.Durable, r.metadata.DeleteWhenUnused, r.metadata.Exclusive, false, args)
 }
 
-func (r *RabbitMQ) Read(handler bindings.Handler) error {
+func (r *RabbitMQ) Read(ctx context.Context, handler bindings.Handler) error {
+	if r.closed.Load() {
+		return errors.New("binding already closed")
+	}
+
 	msgs, err := r.channel.Consume(
 		r.queue.Name,
 		"",
@@ -250,20 +251,45 @@ func (r *RabbitMQ) Read(handler bindings.Handler) error {
 		return err
 	}
 
-	forever := make(chan bool)
+	readCtx, cancel := context.WithCancel(ctx)
+
+	r.wg.Add(2)
+	go func() {
+		defer r.wg.Done()
+		defer cancel()
+		select {
+		case <-r.closeCh:
+		case <-readCtx.Done():
+		}
+	}()
 
 	go func() {
-		for d := range msgs {
-			_, err := handler(context.TODO(), &bindings.ReadResponse{
-				Data: d.Body,
-			})
-			if err == nil {
-				r.channel.Ack(d.DeliveryTag, false)
+		defer r.wg.Done()
+		var err error
+		for {
+			select {
+			case <-readCtx.Done():
+				return
+			case d := <-msgs:
+				_, err = handler(readCtx, &bindings.ReadResponse{
+					Data: d.Body,
+				})
+				if err != nil {
+					r.channel.Nack(d.DeliveryTag, false, true)
+				} else {
+					r.channel.Ack(d.DeliveryTag, false)
+				}
 			}
 		}
 	}()
 
-	<-forever
-
 	return nil
+}
+
+func (r *RabbitMQ) Close() error {
+	if r.closed.CompareAndSwap(false, true) {
+		close(r.closeCh)
+	}
+	defer r.wg.Wait()
+	return r.channel.Close()
 }

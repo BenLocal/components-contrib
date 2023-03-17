@@ -22,11 +22,19 @@ import (
 	"github.com/Shopify/sarama"
 )
 
-func updatePasswordAuthInfo(config *sarama.Config, saslUsername, saslPassword string) {
+func updatePasswordAuthInfo(config *sarama.Config, metadata *kafkaMetadata, saslUsername, saslPassword string) {
 	config.Net.SASL.Enable = true
 	config.Net.SASL.User = saslUsername
 	config.Net.SASL.Password = saslPassword
-	config.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+	if metadata.SaslMechanism == "SHA-256" {
+		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA256} }
+		config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA256
+	} else if metadata.SaslMechanism == "SHA-512" {
+		config.Net.SASL.SCRAMClientGeneratorFunc = func() sarama.SCRAMClient { return &XDGSCRAMClient{HashGeneratorFcn: SHA512} }
+		config.Net.SASL.Mechanism = sarama.SASLTypeSCRAMSHA512
+	} else {
+		config.Net.SASL.Mechanism = sarama.SASLTypePlaintext
+	}
 }
 
 func updateMTLSAuthInfo(config *sarama.Config, metadata *kafkaMetadata) error {
@@ -46,12 +54,12 @@ func updateTLSConfig(config *sarama.Config, metadata *kafkaMetadata) error {
 		config.Net.TLS.Enable = false
 		return nil
 	}
+	config.Net.TLS.Enable = true
+
 	if !metadata.TLSSkipVerify && metadata.TLSCaCert == "" {
-		config.Net.TLS.Enable = false
 		return nil
 	}
-
-	// nolint: gosec
+	//nolint:gosec
 	config.Net.TLS.Config = &tls.Config{InsecureSkipVerify: metadata.TLSSkipVerify, MinVersion: tls.VersionTLS12}
 	if metadata.TLSCaCert != "" {
 		caCertPool := x509.NewCertPool()
@@ -59,7 +67,6 @@ func updateTLSConfig(config *sarama.Config, metadata *kafkaMetadata) error {
 			return errors.New("kafka error: unable to load ca certificate")
 		}
 		config.Net.TLS.Config.RootCAs = caCertPool
-		config.Net.TLS.Enable = true
 	}
 
 	return nil

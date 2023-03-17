@@ -22,13 +22,13 @@ import (
 	global_config "github.com/dapr/dapr/pkg/config"
 	env "github.com/dapr/dapr/pkg/config/env"
 	"github.com/dapr/dapr/pkg/cors"
-	"github.com/dapr/dapr/pkg/grpc"
 	"github.com/dapr/dapr/pkg/modes"
 	"github.com/dapr/dapr/pkg/operator/client"
 	"github.com/dapr/dapr/pkg/resiliency"
 	"github.com/dapr/dapr/pkg/runtime"
 	"github.com/dapr/dapr/pkg/runtime/security"
 	"github.com/dapr/kit/logger"
+	"github.com/phayes/freeport"
 )
 
 const (
@@ -93,10 +93,15 @@ func WithListenAddresses(addresses []string) Option {
 	}
 }
 
-func WithComponentsPath(path string) Option {
+func WithResourcesPath(path string) Option {
 	return func(config *runtime.Config) {
 		config.Standalone.ComponentsPath = path
 	}
+}
+
+// Deprecated: use WithResourcesPath.
+func WithComponentsPath(path string) Option {
+	return WithResourcesPath(path)
 }
 
 func WithProfilePort(port int) Option {
@@ -105,22 +110,58 @@ func WithProfilePort(port int) Option {
 	}
 }
 
+func WithGracefulShutdownDuration(d time.Duration) Option {
+	return func(config *runtime.Config) {
+		config.GracefulShutdownDuration = d
+	}
+}
+
+func WithAPILoggingEnabled(enabled bool) Option {
+	return func(config *runtime.Config) {
+		config.EnableAPILogging = enabled
+	}
+}
+
+func WithProfilingEnabled(enabled bool) Option {
+	return func(config *runtime.Config) {
+		config.EnableProfiling = enabled
+	}
+}
+
 func NewRuntime(appID string, opts ...Option) (*runtime.DaprRuntime, *runtime.Config, error) {
 	var err error
-
-	runtimeConfig := runtime.NewRuntimeConfig(
-		appID, []string{}, controlPlaneAddress,
-		allowedOrigins, config, componentsPath, string(runtime.HTTPProtocol), string(mode),
-		daprHTTPPort, daprInternalGRPC, daprAPIGRPCPort, []string{"127.0.0.1"}, nil, appPort, profilePort,
-		enableProfiling, maxConcurrency, enableMTLS, sentryAddress, appSSL, maxRequestBodySize, "",
-		runtime.DefaultReadBufferSize, false, time.Second, true, false)
+	runtimeConfig := runtime.NewRuntimeConfig(runtime.NewRuntimeConfigOpts{
+		ID:                           appID,
+		HTTPPort:                     daprHTTPPort,
+		InternalGRPCPort:             daprInternalGRPC,
+		APIGRPCPort:                  daprAPIGRPCPort,
+		AppPort:                      appPort,
+		ProfilePort:                  profilePort,
+		APIListenAddresses:           []string{"127.0.0.1"},
+		AppProtocol:                  string(runtime.HTTPProtocol),
+		Mode:                         string(mode),
+		PlacementAddresses:           []string{},
+		GlobalConfig:                 config,
+		AllowedOrigins:               allowedOrigins,
+		ComponentsPath:               componentsPath,
+		EnableProfiling:              enableProfiling,
+		MaxConcurrency:               maxConcurrency,
+		MTLSEnabled:                  enableMTLS,
+		SentryAddress:                sentryAddress,
+		AppSSL:                       appSSL,
+		MaxRequestBodySize:           maxRequestBodySize,
+		ReadBufferSize:               runtime.DefaultReadBufferSize,
+		GracefulShutdownDuration:     time.Second,
+		EnableAPILogging:             true,
+		DisableBuiltinK8sSecretStore: false,
+	})
 
 	for _, opt := range opts {
 		opt(runtimeConfig)
 	}
 
 	if runtimeConfig.InternalGRPCPort == 0 {
-		if runtimeConfig.InternalGRPCPort, err = grpc.GetFreePort(); err != nil {
+		if runtimeConfig.InternalGRPCPort, err = freeport.GetFreePort(); err != nil {
 			return nil, nil, err
 		}
 	}

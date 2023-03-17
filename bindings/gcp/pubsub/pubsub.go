@@ -16,7 +16,10 @@ package pubsub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 
 	"cloud.google.com/go/pubsub"
 	"google.golang.org/api/option"
@@ -36,6 +39,9 @@ type GCPPubSub struct {
 	client   *pubsub.Client
 	metadata *pubSubMetadata
 	logger   logger.Logger
+	closed   atomic.Bool
+	closeCh  chan struct{}
+	wg       sync.WaitGroup
 }
 
 type pubSubMetadata struct {
@@ -54,12 +60,15 @@ type pubSubMetadata struct {
 }
 
 // NewGCPPubSub returns a new GCPPubSub instance.
-func NewGCPPubSub(logger logger.Logger) *GCPPubSub {
-	return &GCPPubSub{logger: logger}
+func NewGCPPubSub(logger logger.Logger) bindings.InputOutputBinding {
+	return &GCPPubSub{
+		logger:  logger,
+		closeCh: make(chan struct{}),
+	}
 }
 
 // Init parses metadata and creates a new Pub Sub client.
-func (g *GCPPubSub) Init(metadata bindings.Metadata) error {
+func (g *GCPPubSub) Init(ctx context.Context, metadata bindings.Metadata) error {
 	b, err := g.parseMetadata(metadata)
 	if err != nil {
 		return err
@@ -71,7 +80,6 @@ func (g *GCPPubSub) Init(metadata bindings.Metadata) error {
 		return err
 	}
 	clientOptions := option.WithCredentialsJSON(b)
-	ctx := context.Background()
 	pubsubClient, err := pubsub.NewClient(ctx, pubsubMeta.ProjectID, clientOptions)
 	if err != nil {
 		return fmt.Errorf("error creating pubsub client: %s", err)
@@ -84,24 +92,34 @@ func (g *GCPPubSub) Init(metadata bindings.Metadata) error {
 }
 
 func (g *GCPPubSub) parseMetadata(metadata bindings.Metadata) ([]byte, error) {
-	b, err := json.Marshal(metadata.Properties)
-
-	return b, err
+	return json.Marshal(metadata.Properties)
 }
 
-func (g *GCPPubSub) Read(handler bindings.Handler) error {
-	sub := g.client.Subscription(g.metadata.Subscription)
-	err := sub.Receive(context.Background(), func(ctx context.Context, m *pubsub.Message) {
-		_, err := handler(ctx, &bindings.ReadResponse{
-			Data:     m.Data,
-			Metadata: map[string]string{id: m.ID, publishTime: m.PublishTime.String()},
-		})
-		if err == nil {
+func (g *GCPPubSub) Read(ctx context.Context, handler bindings.Handler) error {
+	if g.closed.Load() {
+		return errors.New("binding is closed")
+	}
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		sub := g.client.Subscription(g.metadata.Subscription)
+		err := sub.Receive(ctx, func(c context.Context, m *pubsub.Message) {
+			_, err := handler(c, &bindings.ReadResponse{
+				Data:     m.Data,
+				Metadata: map[string]string{id: m.ID, publishTime: m.PublishTime.String()},
+			})
+			if err != nil {
+				m.Nack()
+				return
+			}
 			m.Ack()
+		})
+		if err != nil {
+			g.logger.Errorf("error receiving messages: %v", err)
 		}
-	})
+	}()
 
-	return err
+	return nil
 }
 
 func (g *GCPPubSub) Operations() []bindings.OperationKind {
@@ -123,5 +141,9 @@ func (g *GCPPubSub) Invoke(ctx context.Context, req *bindings.InvokeRequest) (*b
 }
 
 func (g *GCPPubSub) Close() error {
+	if g.closed.CompareAndSwap(false, true) {
+		close(g.closeCh)
+	}
+	defer g.wg.Wait()
 	return g.client.Close()
 }

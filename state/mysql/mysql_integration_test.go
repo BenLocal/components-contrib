@@ -3,7 +3,9 @@ Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -13,22 +15,25 @@ limitations under the License.
 package mysql
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/state"
 	"github.com/dapr/kit/logger"
+	"github.com/dapr/kit/ptr"
 )
 
 const (
@@ -41,6 +46,14 @@ const (
 
 type fakeItem struct {
 	Color string
+}
+
+func (f fakeItem) MarshalJSON() ([]byte, error) {
+	return json.Marshal(f.Color)
+}
+
+func (f *fakeItem) UnmarshalJSON(data []byte) error {
+	return json.Unmarshal(data, &f.Color)
 }
 
 func TestMySQLIntegration(t *testing.T) {
@@ -59,53 +72,180 @@ func TestMySQLIntegration(t *testing.T) {
 	}
 
 	t.Run("Test init configurations", func(t *testing.T) {
-		testInitConfiguration(t)
+		// Tests valid and invalid config settings.
+		logger := logger.NewLogger("test")
+
+		// define a struct the contain the metadata and create
+		// two instances of it in a tests slice
+		tests := []struct {
+			name        string
+			props       map[string]string
+			expectedErr string
+		}{
+			{
+				name:        "Empty",
+				props:       map[string]string{},
+				expectedErr: errMissingConnectionString,
+			},
+			{
+				name: "Valid connection string",
+				props: map[string]string{
+					keyConnectionString: getConnectionString(""),
+					keyPemPath:          getPemPath(),
+				},
+				expectedErr: "",
+			},
+			{
+				name: "Valid table name",
+				props: map[string]string{
+					keyConnectionString: getConnectionString(""),
+					keyPemPath:          getPemPath(),
+					keyTableName:        "stateStore",
+				},
+				expectedErr: "",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				p := NewMySQLStateStore(logger).(*MySQL)
+				defer p.Close()
+
+				metadata := state.Metadata{
+					Base: metadata.Base{Properties: tt.props},
+				}
+
+				err := p.Init(context.Background(), metadata)
+
+				if tt.expectedErr == "" {
+					assert.Nil(t, err)
+				} else {
+					assert.NotNil(t, err)
+					assert.Equal(t, err.Error(), tt.expectedErr)
+				}
+			})
+		}
 	})
 
 	pemPath := getPemPath()
 
 	metadata := state.Metadata{
-		Properties: map[string]string{connectionStringKey: connectionString, pemPathKey: pemPath},
+		Base: metadata.Base{Properties: map[string]string{keyConnectionString: connectionString, keyPemPath: pemPath}},
 	}
 
-	mys := NewMySQLStateStore(logger.NewLogger("test"))
+	mys := NewMySQLStateStore(logger.NewLogger("test")).(*MySQL)
 	t.Cleanup(func() {
 		defer mys.Close()
 	})
 
-	error := mys.Init(metadata)
+	error := mys.Init(context.Background(), metadata)
 	if error != nil {
 		t.Fatal(error)
 	}
 
 	t.Run("Create table succeeds", func(t *testing.T) {
 		t.Parallel()
-		testCreateTable(t, mys)
+
+		tableName := "test_state"
+
+		// Drop the table if it already exists
+		exists, err := tableExists(context.Background(), mys.db, tableName, 10*time.Second)
+		assert.Nil(t, err)
+		if exists {
+			dropTable(t, mys.db, tableName)
+		}
+
+		// Create the state table and test for its existence
+		// There should be no error
+		err = mys.ensureStateTable(context.Background(), tableName)
+		assert.Nil(t, err)
+
+		// Now create it and make sure there are no errors
+		exists, err = tableExists(context.Background(), mys.db, tableName, 10*time.Second)
+		assert.Nil(t, err)
+		assert.True(t, exists)
+
+		// Drop the state table
+		dropTable(t, mys.db, tableName)
 	})
 
 	t.Run("Get Set Delete one item", func(t *testing.T) {
 		t.Parallel()
-		setGetUpdateDeleteOneItem(t, mys)
+
+		// Validates setting one item, getting it, and deleting it.
+		key := randomKey()
+		value := &fakeItem{Color: "yellow"}
+
+		setItem(t, mys, key, value, nil)
+
+		getResponse, outputObject := getItem(t, mys, key)
+		assert.Equal(t, value, outputObject)
+
+		newValue := &fakeItem{Color: "green"}
+		setItem(t, mys, key, newValue, getResponse.ETag)
+		getResponse, outputObject = getItem(t, mys, key)
+		assert.Equal(t, newValue, outputObject)
+
+		deleteItem(t, mys, key, getResponse.ETag)
 	})
 
 	t.Run("Get item that does not exist", func(t *testing.T) {
 		t.Parallel()
-		getItemThatDoesNotExist(t, mys)
+
+		// Validates the behavior of retrieving an item that  does not exist.
+		key := randomKey()
+		response, outputObject := getItem(t, mys, key)
+		assert.Nil(t, response.Data)
+		assert.Equal(t, "", outputObject.Color)
 	})
 
 	t.Run("Get item with no key fails", func(t *testing.T) {
 		t.Parallel()
-		getItemWithNoKey(t, mys)
+
+		// Validates that attempting a Get operation without providing a key will return an error.
+		getReq := &state.GetRequest{
+			Key: "",
+		}
+
+		response, getErr := mys.Get(context.Background(), getReq)
+		assert.NotNil(t, getErr)
+		assert.Nil(t, response)
 	})
 
 	t.Run("Set updates the updatedate field", func(t *testing.T) {
 		t.Parallel()
-		setUpdatesTheUpdatedateField(t, mys)
+
+		// Proves that the updatedate is set for an
+		// update, and set upon insert. The updatedate is used as the eTag so must be
+		// set. It is also auto updated on update by MySQL.
+		key := randomKey()
+		value := &fakeItem{Color: "orange"}
+		setItem(t, mys, key, value, nil)
+
+		// insertdate and updatedate should have a value
+		_, insertdate, updatedate, eTag := getRowData(t, key)
+		assert.NotNil(t, insertdate, "insertdate was not set")
+		assert.NotNil(t, updatedate, "updatedate was not set")
+
+		// insertdate should not change, updatedate should have a value
+		value = &fakeItem{Color: "aqua"}
+		setItem(t, mys, key, value, nil)
+		_, newinsertdate, _, newETag := getRowData(t, key)
+		assert.Equal(t, insertdate, newinsertdate, "InsertDate was changed")
+		assert.NotEqual(t, eTag, newETag, "eTag was not updated")
+
+		deleteItem(t, mys, key, nil)
 	})
 
 	t.Run("Set item with no key fails", func(t *testing.T) {
 		t.Parallel()
-		setItemWithNoKey(t, mys)
+
+		setReq := &state.SetRequest{
+			Key: "",
+		}
+
+		err := mys.Set(context.Background(), setReq)
+		assert.NotNil(t, err, "Error was not nil when setting item with no key.")
 	})
 
 	t.Run("Bulk set and bulk delete", func(t *testing.T) {
@@ -115,255 +255,300 @@ func TestMySQLIntegration(t *testing.T) {
 
 	t.Run("Update and delete with eTag succeeds", func(t *testing.T) {
 		t.Parallel()
-		updateAndDeleteWithETagSucceeds(t, mys)
+
+		// Create and retrieve new item
+		key := randomKey()
+		value := &fakeItem{Color: "hazel"}
+		setItem(t, mys, key, value, nil)
+		getResponse, _ := getItem(t, mys, key)
+		assert.NotNil(t, getResponse.ETag)
+
+		// Change the value and compare
+		value.Color = "purple"
+		setItem(t, mys, key, value, getResponse.ETag)
+		updateResponse, updatedItem := getItem(t, mys, key)
+		assert.Equal(t, value, updatedItem, "Item should have been updated")
+		assert.NotEqual(t, getResponse.ETag, updateResponse.ETag,
+			"ETag should change when item is updated")
+
+		// Delete
+		deleteItem(t, mys, key, updateResponse.ETag)
+
+		assert.False(t, storeItemExists(t, key), "Item is not in the data store")
 	})
 
 	t.Run("Update with old eTag fails", func(t *testing.T) {
 		t.Parallel()
-		updateWithOldETagFails(t, mys)
+
+		// Create and retrieve new item
+		key := randomKey()
+		value := &fakeItem{Color: "gray"}
+		setItem(t, mys, key, value, nil)
+
+		getResponse, _ := getItem(t, mys, key)
+		assert.NotNil(t, getResponse.ETag)
+		originalEtag := getResponse.ETag
+
+		// Change the value and get the updated eTag
+		newValue := &fakeItem{Color: "silver"}
+		setItem(t, mys, key, newValue, originalEtag)
+
+		_, updatedItem := getItem(t, mys, key)
+		assert.Equal(t, newValue, updatedItem)
+
+		// Update again with the original eTag - expect update failure
+		newValue = &fakeItem{Color: "maroon"}
+		setReq := &state.SetRequest{
+			Key:   key,
+			ETag:  originalEtag,
+			Value: newValue,
+		}
+
+		err := mys.Set(context.Background(), setReq)
+		assert.NotNil(t, err, "Error was not thrown using old eTag")
 	})
 
 	t.Run("Insert with eTag fails", func(t *testing.T) {
 		t.Parallel()
-		newItemWithEtagFails(t, mys)
+
+		value := &fakeItem{Color: "teal"}
+		invalidETag := "12345"
+
+		setReq := &state.SetRequest{
+			Key:   randomKey(),
+			ETag:  &invalidETag,
+			Value: value,
+		}
+
+		err := mys.Set(context.Background(), setReq)
+		assert.NotNil(t, err)
 	})
 
 	t.Run("Delete with invalid eTag fails", func(t *testing.T) {
 		t.Parallel()
-		deleteWithInvalidEtagFails(t, mys)
+
+		// Create new item
+		key := randomKey()
+		value := &fakeItem{Color: "mauve"}
+		setItem(t, mys, key, value, nil)
+
+		eTag := "1234"
+
+		// Delete the item with a fake eTag
+		deleteReq := &state.DeleteRequest{
+			Key:  key,
+			ETag: &eTag,
+		}
+
+		err := mys.Delete(context.Background(), deleteReq)
+		assert.NotNil(t, err)
 	})
 
 	t.Run("Delete item with no key fails", func(t *testing.T) {
 		t.Parallel()
-		deleteWithNoKeyFails(t, mys)
+
+		deleteReq := &state.DeleteRequest{
+			Key: "",
+		}
+
+		err := mys.Delete(context.Background(), deleteReq)
+		assert.NotNil(t, err)
 	})
 
 	t.Run("Delete an item that does not exist", func(t *testing.T) {
 		t.Parallel()
-		deleteItemThatDoesNotExist(t, mys)
+
+		// Delete the item with a key not in the store
+		deleteReq := &state.DeleteRequest{
+			Key: randomKey(),
+		}
+
+		err := mys.Delete(context.Background(), deleteReq)
+		assert.Nil(t, err)
+	})
+
+	t.Run("Inserts with first-write-wins", func(t *testing.T) {
+		t.Parallel()
+
+		// Insert without an etag should work on new keys
+		key := randomKey()
+		setReq := &state.SetRequest{
+			Key:   key,
+			Value: &fakeItem{Color: "teal"},
+			Options: state.SetStateOption{
+				Concurrency: state.FirstWrite,
+			},
+		}
+
+		err := mys.Set(context.Background(), setReq)
+		assert.NoError(t, err)
+
+		// Get the etag
+		getResponse, _ := getItem(t, mys, key)
+		assert.NotNil(t, getResponse)
+		assert.NotNil(t, getResponse.ETag)
+		originalEtag := getResponse.ETag
+
+		// Insert without an etag should fail on existing keys
+		setReq = &state.SetRequest{
+			Key:   key,
+			Value: &fakeItem{Color: "gray or grey"},
+			Options: state.SetStateOption{
+				Concurrency: state.FirstWrite,
+			},
+		}
+
+		err = mys.Set(context.Background(), setReq)
+		assert.ErrorContains(t, err, "Duplicate entry")
+
+		// Insert with invalid etag should fail on existing keys
+		setReq = &state.SetRequest{
+			Key:   key,
+			Value: &fakeItem{Color: "pink"},
+			ETag:  ptr.Of("no-etag"),
+			Options: state.SetStateOption{
+				Concurrency: state.FirstWrite,
+			},
+		}
+
+		err = mys.Set(context.Background(), setReq)
+		assert.ErrorContains(t, err, "possible etag mismatch")
+
+		// Insert with valid etag should succeed on existing keys
+		setReq = &state.SetRequest{
+			Key:   key,
+			Value: &fakeItem{Color: "scarlet"},
+			ETag:  originalEtag,
+			Options: state.SetStateOption{
+				Concurrency: state.FirstWrite,
+			},
+		}
+
+		err = mys.Set(context.Background(), setReq)
+		assert.NoError(t, err)
+
+		// Insert with an etag should fail on new keys
+		setReq = &state.SetRequest{
+			Key:   randomKey(),
+			Value: &fakeItem{Color: "greige"},
+			ETag:  ptr.Of("myetag"),
+			Options: state.SetStateOption{
+				Concurrency: state.FirstWrite,
+			},
+		}
+
+		err = mys.Set(context.Background(), setReq)
+		assert.ErrorContains(t, err, "possible etag mismatch")
 	})
 
 	t.Run("Multi with delete and set", func(t *testing.T) {
 		t.Parallel()
-		multiWithDeleteAndSet(t, mys)
+
+		var operations []state.TransactionalStateOperation
+		var deleteRequests []state.DeleteRequest
+		for i := 0; i < 3; i++ {
+			req := state.DeleteRequest{Key: randomKey()}
+
+			// Add the item to the database
+			setItem(t, mys, req.Key, randomJSON(), nil)
+
+			// Add the item to a slice of delete requests
+			deleteRequests = append(deleteRequests, req)
+
+			// Add the item to the multi transaction request
+			operations = append(operations, state.TransactionalStateOperation{
+				Operation: state.Delete,
+				Request:   req,
+			})
+		}
+
+		// Create the set requests
+		var setRequests []state.SetRequest
+		for i := 0; i < 3; i++ {
+			req := state.SetRequest{
+				Key:   randomKey(),
+				Value: randomJSON(),
+			}
+			setRequests = append(setRequests, req)
+			operations = append(operations, state.TransactionalStateOperation{
+				Operation: state.Upsert,
+				Request:   req,
+			})
+		}
+
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
+			Operations: operations,
+		})
+		assert.Nil(t, err)
+
+		for _, delete := range deleteRequests {
+			assert.False(t, storeItemExists(t, delete.Key))
+		}
+
+		for _, set := range setRequests {
+			assert.True(t, storeItemExists(t, set.Key))
+			deleteItem(t, mys, set.Key, nil)
+		}
 	})
 
 	t.Run("Multi with delete only", func(t *testing.T) {
 		t.Parallel()
-		multiWithDeleteOnly(t, mys)
+
+		var operations []state.TransactionalStateOperation
+		var deleteRequests []state.DeleteRequest
+		for i := 0; i < 3; i++ {
+			req := state.DeleteRequest{Key: randomKey()}
+
+			// Add the item to the database
+			setItem(t, mys, req.Key, randomJSON(), nil)
+
+			// Add the item to a slice of delete requests
+			deleteRequests = append(deleteRequests, req)
+
+			// Add the item to the multi transaction request
+			operations = append(operations, state.TransactionalStateOperation{
+				Operation: state.Delete,
+				Request:   req,
+			})
+		}
+
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
+			Operations: operations,
+		})
+		assert.Nil(t, err)
+
+		for _, delete := range deleteRequests {
+			assert.False(t, storeItemExists(t, delete.Key))
+		}
 	})
 
 	t.Run("Multi with set only", func(t *testing.T) {
 		t.Parallel()
-		multiWithSetOnly(t, mys)
-	})
-}
 
-func multiWithSetOnly(t *testing.T, mys *MySQL) {
-	var operations []state.TransactionalStateOperation
-	var setRequests []state.SetRequest
-	for i := 0; i < 3; i++ {
-		req := state.SetRequest{
-			Key:   randomKey(),
-			Value: randomJSON(),
+		var operations []state.TransactionalStateOperation
+		var setRequests []state.SetRequest
+		for i := 0; i < 3; i++ {
+			req := state.SetRequest{
+				Key:   randomKey(),
+				Value: randomJSON(),
+			}
+			setRequests = append(setRequests, req)
+			operations = append(operations, state.TransactionalStateOperation{
+				Operation: state.Upsert,
+				Request:   req,
+			})
 		}
-		setRequests = append(setRequests, req)
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Upsert,
-			Request:   req,
+
+		err := mys.Multi(context.Background(), &state.TransactionalStateRequest{
+			Operations: operations,
 		})
-	}
+		assert.Nil(t, err)
 
-	err := mys.Multi(&state.TransactionalStateRequest{
-		Operations: operations,
-	})
-	assert.Nil(t, err)
-
-	for _, set := range setRequests {
-		assert.True(t, storeItemExists(t, set.Key))
-		deleteItem(t, mys, set.Key, nil)
-	}
-}
-
-func multiWithDeleteOnly(t *testing.T, mys *MySQL) {
-	var operations []state.TransactionalStateOperation
-	var deleteRequests []state.DeleteRequest
-	for i := 0; i < 3; i++ {
-		req := state.DeleteRequest{Key: randomKey()}
-
-		// Add the item to the database
-		setItem(t, mys, req.Key, randomJSON(), nil)
-
-		// Add the item to a slice of delete requests
-		deleteRequests = append(deleteRequests, req)
-
-		// Add the item to the multi transaction request
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Delete,
-			Request:   req,
-		})
-	}
-
-	err := mys.Multi(&state.TransactionalStateRequest{
-		Operations: operations,
-	})
-	assert.Nil(t, err)
-
-	for _, delete := range deleteRequests {
-		assert.False(t, storeItemExists(t, delete.Key))
-	}
-}
-
-func multiWithDeleteAndSet(t *testing.T, mys *MySQL) {
-	var operations []state.TransactionalStateOperation
-	var deleteRequests []state.DeleteRequest
-	for i := 0; i < 3; i++ {
-		req := state.DeleteRequest{Key: randomKey()}
-
-		// Add the item to the database
-		setItem(t, mys, req.Key, randomJSON(), nil)
-
-		// Add the item to a slice of delete requests
-		deleteRequests = append(deleteRequests, req)
-
-		// Add the item to the multi transaction request
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Delete,
-			Request:   req,
-		})
-	}
-
-	// Create the set requests
-	var setRequests []state.SetRequest
-	for i := 0; i < 3; i++ {
-		req := state.SetRequest{
-			Key:   randomKey(),
-			Value: randomJSON(),
+		for _, set := range setRequests {
+			assert.True(t, storeItemExists(t, set.Key))
+			deleteItem(t, mys, set.Key, nil)
 		}
-		setRequests = append(setRequests, req)
-		operations = append(operations, state.TransactionalStateOperation{
-			Operation: state.Upsert,
-			Request:   req,
-		})
-	}
-
-	err := mys.Multi(&state.TransactionalStateRequest{
-		Operations: operations,
 	})
-	assert.Nil(t, err)
-
-	for _, delete := range deleteRequests {
-		assert.False(t, storeItemExists(t, delete.Key))
-	}
-
-	for _, set := range setRequests {
-		assert.True(t, storeItemExists(t, set.Key))
-		deleteItem(t, mys, set.Key, nil)
-	}
-}
-
-func deleteItemThatDoesNotExist(t *testing.T, mys *MySQL) {
-	// Delete the item with a key not in the store
-	deleteReq := &state.DeleteRequest{
-		Key: randomKey(),
-	}
-
-	err := mys.Delete(deleteReq)
-	assert.Nil(t, err)
-}
-
-func deleteWithNoKeyFails(t *testing.T, mys *MySQL) {
-	deleteReq := &state.DeleteRequest{
-		Key: "",
-	}
-
-	err := mys.Delete(deleteReq)
-	assert.NotNil(t, err)
-}
-
-func deleteWithInvalidEtagFails(t *testing.T, mys *MySQL) {
-	// Create new item
-	key := randomKey()
-	value := &fakeItem{Color: "mauve"}
-	setItem(t, mys, key, value, nil)
-
-	eTag := "1234"
-
-	// Delete the item with a fake eTag
-	deleteReq := &state.DeleteRequest{
-		Key:  key,
-		ETag: &eTag,
-	}
-
-	err := mys.Delete(deleteReq)
-	assert.NotNil(t, err)
-}
-
-// newItemWithEtagFails creates a new item and also supplies an ETag, which is
-// invalid - expect failure.
-func newItemWithEtagFails(t *testing.T, mys *MySQL) {
-	value := &fakeItem{Color: "teal"}
-	invalidETag := "12345"
-
-	setReq := &state.SetRequest{
-		Key:   randomKey(),
-		ETag:  &invalidETag,
-		Value: value,
-	}
-
-	err := mys.Set(setReq)
-	assert.NotNil(t, err)
-}
-
-func updateWithOldETagFails(t *testing.T, mys *MySQL) {
-	// Create and retrieve new item
-	key := randomKey()
-	value := &fakeItem{Color: "gray"}
-	setItem(t, mys, key, value, nil)
-
-	getResponse, _ := getItem(t, mys, key)
-	assert.NotNil(t, getResponse.ETag)
-	originalEtag := getResponse.ETag
-
-	// Change the value and get the updated eTag
-	newValue := &fakeItem{Color: "silver"}
-	setItem(t, mys, key, newValue, originalEtag)
-
-	_, updatedItem := getItem(t, mys, key)
-	assert.Equal(t, newValue, updatedItem)
-
-	// Update again with the original eTag - expect update failure
-	newValue = &fakeItem{Color: "maroon"}
-	setReq := &state.SetRequest{
-		Key:   key,
-		ETag:  originalEtag,
-		Value: newValue,
-	}
-
-	err := mys.Set(setReq)
-	assert.NotNil(t, err, "Error was not thrown using old eTag")
-}
-
-func updateAndDeleteWithETagSucceeds(t *testing.T, mys *MySQL) {
-	// Create and retrieve new item
-	key := randomKey()
-	value := &fakeItem{Color: "hazel"}
-	setItem(t, mys, key, value, nil)
-	getResponse, _ := getItem(t, mys, key)
-	assert.NotNil(t, getResponse.ETag)
-
-	// Change the value and compare
-	value.Color = "purple"
-	setItem(t, mys, key, value, getResponse.ETag)
-	updateResponse, updatedItem := getItem(t, mys, key)
-	assert.Equal(t, value, updatedItem, "Item should have been updated")
-	assert.NotEqual(t, getResponse.ETag, updateResponse.ETag,
-		"ETag should change when item is updated")
-
-	// Delete
-	deleteItem(t, mys, key, updateResponse.ETag)
-
-	assert.False(t, storeItemExists(t, key), "Item is not in the data store")
 }
 
 // Tests valid bulk sets and deletes.
@@ -379,7 +564,7 @@ func testBulkSetAndBulkDelete(t *testing.T, mys *MySQL) {
 		},
 	}
 
-	err := mys.BulkSet(setReq)
+	err := mys.BulkSet(context.Background(), setReq)
 	assert.Nil(t, err)
 	assert.True(t, storeItemExists(t, setReq[0].Key))
 	assert.True(t, storeItemExists(t, setReq[1].Key))
@@ -393,163 +578,10 @@ func testBulkSetAndBulkDelete(t *testing.T, mys *MySQL) {
 		},
 	}
 
-	err = mys.BulkDelete(deleteReq)
+	err = mys.BulkDelete(context.Background(), deleteReq)
 	assert.Nil(t, err)
 	assert.False(t, storeItemExists(t, setReq[0].Key))
 	assert.False(t, storeItemExists(t, setReq[1].Key))
-}
-
-func setItemWithNoKey(t *testing.T, mys *MySQL) {
-	setReq := &state.SetRequest{
-		Key: "",
-	}
-
-	err := mys.Set(setReq)
-	assert.NotNil(t, err, "Error was not nil when setting item with no key.")
-}
-
-// setUpdatesTheUpdatedateField proves that the updatedate is set for an
-// update, and set upon insert. The updatedate is used as the eTag so must be
-// set. It is also auto updated on update by MySQL.
-func setUpdatesTheUpdatedateField(t *testing.T, mys *MySQL) {
-	key := randomKey()
-	value := &fakeItem{Color: "orange"}
-	setItem(t, mys, key, value, nil)
-
-	// insertdate and updatedate should have a value
-	_, insertdate, updatedate, eTag := getRowData(t, key)
-	assert.NotNil(t, insertdate, "insertdate was not set")
-	assert.NotNil(t, updatedate, "updatedate was not set")
-
-	// insertdate should not change, updatedate should have a value
-	value = &fakeItem{Color: "aqua"}
-	setItem(t, mys, key, value, nil)
-	_, newinsertdate, _, newETag := getRowData(t, key)
-	assert.Equal(t, insertdate, newinsertdate, "InsertDate was changed")
-	assert.NotEqual(t, eTag, newETag, "eTag was not updated")
-
-	deleteItem(t, mys, key, nil)
-}
-
-// getItemWithNoKey validates that attempting a Get operation without providing
-// a key will return an error.
-func getItemWithNoKey(t *testing.T, mys *MySQL) {
-	getReq := &state.GetRequest{
-		Key: "",
-	}
-
-	response, getErr := mys.Get(getReq)
-	assert.NotNil(t, getErr)
-	assert.Nil(t, response)
-}
-
-// getItemThatDoesNotExist validates the behavior of retrieving an item that
-// does not exist.
-func getItemThatDoesNotExist(t *testing.T, mys *MySQL) {
-	key := randomKey()
-	response, outputObject := getItem(t, mys, key)
-	assert.Nil(t, response.Data)
-	assert.Equal(t, "", outputObject.Color)
-}
-
-// setGetUpdateDeleteOneItem validates setting one item, getting it, and
-// deleting it.
-func setGetUpdateDeleteOneItem(t *testing.T, mys *MySQL) {
-	key := randomKey()
-	value := &fakeItem{Color: "yellow"}
-
-	setItem(t, mys, key, value, nil)
-
-	getResponse, outputObject := getItem(t, mys, key)
-	assert.Equal(t, value, outputObject)
-
-	newValue := &fakeItem{Color: "green"}
-	setItem(t, mys, key, newValue, getResponse.ETag)
-	getResponse, outputObject = getItem(t, mys, key)
-	assert.Equal(t, newValue, outputObject)
-
-	deleteItem(t, mys, key, getResponse.ETag)
-}
-
-// testCreateTable tests the ability to create the state table.
-func testCreateTable(t *testing.T, mys *MySQL) {
-	tableName := "test_state"
-
-	// Drop the table if it already exists
-	exists, err := tableExists(mys.db, tableName)
-	assert.Nil(t, err)
-	if exists {
-		dropTable(t, mys.db, tableName)
-	}
-
-	// Create the state table and test for its existence
-	// There should be no error
-	err = mys.ensureStateTable(tableName)
-	assert.Nil(t, err)
-
-	// Now create it and make sure there are no errors
-	exists, err = tableExists(mys.db, tableName)
-	assert.Nil(t, err)
-	assert.True(t, exists)
-
-	// Drop the state table
-	dropTable(t, mys.db, tableName)
-}
-
-// testInitConfiguration tests valid and invalid config settings.
-func testInitConfiguration(t *testing.T) {
-	logger := logger.NewLogger("test")
-
-	// define a struct the contain the metadata and create
-	// two instances of it in a tests slice
-	tests := []struct {
-		name        string
-		props       map[string]string
-		expectedErr string
-	}{
-		{
-			name:        "Empty",
-			props:       map[string]string{},
-			expectedErr: errMissingConnectionString,
-		},
-		{
-			name: "Valid connection string",
-			props: map[string]string{
-				connectionStringKey: getConnectionString(""),
-				pemPathKey:          getPemPath(),
-			},
-			expectedErr: "",
-		},
-		{
-			name: "Valid table name",
-			props: map[string]string{
-				connectionStringKey: getConnectionString(""),
-				pemPathKey:          getPemPath(),
-				tableNameKey:        "stateStore",
-			},
-			expectedErr: "",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			p := NewMySQLStateStore(logger)
-			defer p.Close()
-
-			metadata := state.Metadata{
-				Properties: tt.props,
-			}
-
-			err := p.Init(metadata)
-
-			if tt.expectedErr == "" {
-				assert.Nil(t, err)
-			} else {
-				assert.NotNil(t, err)
-				assert.Equal(t, err.Error(), tt.expectedErr)
-			}
-		})
-	}
 }
 
 func dropTable(t *testing.T, db *sql.DB, tableName string) {
@@ -566,7 +598,7 @@ func setItem(t *testing.T, mys *MySQL, key string, value interface{}, eTag *stri
 		Value: value,
 	}
 
-	err := mys.Set(setReq)
+	err := mys.Set(context.Background(), setReq)
 	assert.Nil(t, err, "Error setting an item")
 	itemExists := storeItemExists(t, key)
 	assert.True(t, itemExists, "Item does not exist after being set")
@@ -578,7 +610,7 @@ func getItem(t *testing.T, mys *MySQL, key string) (*state.GetResponse, *fakeIte
 		Options: state.GetStateOption{},
 	}
 
-	response, getErr := mys.Get(getReq)
+	response, getErr := mys.Get(context.Background(), getReq)
 	assert.Nil(t, getErr)
 	assert.NotNil(t, response)
 	outputObject := &fakeItem{}
@@ -594,7 +626,7 @@ func deleteItem(t *testing.T, mys *MySQL, key string, eTag *string) {
 		Options: state.DeleteStateOption{},
 	}
 
-	deleteErr := mys.Delete(deleteReq)
+	deleteErr := mys.Delete(context.Background(), deleteReq)
 	assert.Nil(t, deleteErr, "There was an error deleting a record")
 	assert.False(t, storeItemExists(t, key), "Item still exists after delete")
 }
@@ -632,7 +664,7 @@ func connectToDB(t *testing.T) (*sql.DB, error) {
 	val := getPemPath()
 	if val != "" {
 		rootCertPool := x509.NewCertPool()
-		pem, readErr := ioutil.ReadFile(val)
+		pem, readErr := os.ReadFile(val)
 
 		assert.Nil(t, readErr, "Could not read PEM file")
 

@@ -14,25 +14,28 @@ limitations under the License.
 package file
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
 
+	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
-	"github.com/dapr/kit/config"
 	"github.com/dapr/kit/logger"
 )
 
 type localSecretStoreMetaData struct {
-	SecretsFile     string `mapstructure:"secretsFile"`
-	NestedSeparator string `mapstructure:"nestedSeparator"`
-	MultiValued     bool   `mapstructure:"multiValued"`
+	SecretsFile     string
+	NestedSeparator string
+	MultiValued     bool
 }
+
+var _ secretstores.SecretStore = (*localSecretStore)(nil)
 
 type localSecretStore struct {
 	secretsFile     string
@@ -41,6 +44,7 @@ type localSecretStore struct {
 	currentPath     string
 	secrets         map[string]interface{}
 	readLocalFileFn func(secretsFile string) (map[string]interface{}, error)
+	features        []secretstores.Feature
 	logger          logger.Logger
 }
 
@@ -52,7 +56,7 @@ func NewLocalSecretStore(logger logger.Logger) secretstores.SecretStore {
 }
 
 // Init creates a Local secret store.
-func (j *localSecretStore) Init(metadata secretstores.Metadata) error {
+func (j *localSecretStore) Init(_ context.Context, metadata secretstores.Metadata) error {
 	meta, err := j.getLocalSecretStoreMetadata(metadata)
 	if err != nil {
 		return err
@@ -86,16 +90,24 @@ func (j *localSecretStore) Init(metadata secretstores.Metadata) error {
 			}
 		}
 		j.secrets = allSecrets
+		// If MultiValued is set, this secret store supports a multiple
+		// key-valyes per secret.
+		j.features = []secretstores.Feature{
+			secretstores.FeatureMultipleKeyValuesPerSecret,
+		}
 	} else {
 		j.secrets = map[string]interface{}{}
 		j.visitJSONObject(jsonConfig)
+		// MultiValued is not set: reset to its default single-value per
+		// secret (no extra feature) behavior.
+		j.features = []secretstores.Feature{}
 	}
 
 	return nil
 }
 
 // GetSecret retrieves a secret using a key and returns a map of decrypted string/string values.
-func (j *localSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (j *localSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	secretValue, exists := j.secrets[req.Name]
 	if !exists {
 		return secretstores.GetSecretResponse{}, fmt.Errorf("secret %s not found", req.Name)
@@ -124,7 +136,7 @@ func (j *localSecretStore) GetSecret(req secretstores.GetSecretRequest) (secrets
 }
 
 // BulkGetSecret retrieves all secrets in the store and returns a map of decrypted string/string values.
-func (j *localSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (j *localSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	r := map[string]map[string]string{}
 
 	for k, v := range j.secrets {
@@ -225,7 +237,7 @@ func (j *localSecretStore) combine(values []string) string {
 
 func (j *localSecretStore) getLocalSecretStoreMetadata(spec secretstores.Metadata) (*localSecretStoreMetaData, error) {
 	var meta localSecretStoreMetaData
-	err := config.Decode(spec.Properties, &meta)
+	err := metadata.DecodeMetadata(spec.Properties, &meta)
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +258,7 @@ func (j *localSecretStore) readLocalFile(secretsFile string) (map[string]interfa
 
 	defer jsonFile.Close()
 
-	byteValue, err := ioutil.ReadAll(jsonFile)
+	byteValue, err := io.ReadAll(jsonFile)
 	if err != nil {
 		return nil, err
 	}
@@ -258,4 +270,16 @@ func (j *localSecretStore) readLocalFile(secretsFile string) (map[string]interfa
 	}
 
 	return jsonConfig, nil
+}
+
+// Features returns the features available in this secret store.
+func (j *localSecretStore) Features() []secretstores.Feature {
+	return j.features
+}
+
+func (j *localSecretStore) GetComponentMetadata() map[string]string {
+	metadataStruct := localSecretStoreMetaData{}
+	metadataInfo := map[string]string{}
+	metadata.GetMetadataInfoFromStructType(reflect.TypeOf(metadataStruct), &metadataInfo)
+	return metadataInfo
 }
