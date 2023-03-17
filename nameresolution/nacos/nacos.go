@@ -16,6 +16,7 @@ package nacos
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/dapr/components-contrib/nameresolution"
 	nr "github.com/dapr/components-contrib/nameresolution"
@@ -106,7 +107,7 @@ func (r *resolver) Init(metadata nameresolution.Metadata) error {
 		})
 	}
 
-	cc := &constant.ClientConfig{
+	cc := constant.ClientConfig{
 		NamespaceId:         config.Client.NamespaceId,
 		TimeoutMs:           config.Client.TimeoutMs,
 		NotLoadCacheAtStart: config.Client.NotLoadCacheAtStart,
@@ -116,7 +117,7 @@ func (r *resolver) Init(metadata nameresolution.Metadata) error {
 	}
 
 	r.client, err = nacos.NewNamingClient(vo.NacosClientParam{
-		ClientConfig:  cc,
+		ClientConfig:  &cc,
 		ServerConfigs: sc,
 	})
 	if err != nil {
@@ -125,25 +126,43 @@ func (r *resolver) Init(metadata nameresolution.Metadata) error {
 
 	// Registe
 	if config.Register != nil {
-		r.client.RegisterInstance(vo.RegisterInstanceParam{
+		appId, ok := metadata.Properties[nr.AppID]
+		if !ok {
+			return fmt.Errorf("metadata property missing: %s", nr.AppID)
+		}
+
+		daprPort, ok := metadata.Properties[nr.DaprPort]
+		if !ok {
+			return fmt.Errorf("metadata property missing: %s", nr.DaprPort)
+		}
+		tmp, _ := strconv.Atoi(daprPort)
+		port := uint64(tmp)
+
+		b, err := r.client.RegisterInstance(vo.RegisterInstanceParam{
 			Ip:          config.Register.Ip,
-			Port:        config.Register.Port,
+			Port:        port,
 			Weight:      config.Register.Weight,
 			Enable:      config.Register.Enable,
 			Healthy:     config.Register.Healthy,
 			Metadata:    config.Register.Metadata,
 			ClusterName: config.Register.ClusterName,
-			ServiceName: config.Register.ServiceName,
+			ServiceName: appId,
 			GroupName:   config.Register.GroupName,
 			Ephemeral:   config.Register.Ephemeral,
 		})
+
+		if err != nil || !b {
+			return fmt.Errorf("nacos name error: register instance failed. %w ", err)
+		}
 	}
 
 	return nil
 }
 
 func (r *resolver) ResolveID(req nameresolution.ResolveRequest) (string, error) {
-	params := vo.SelectOneHealthInstanceParam{}
+	params := vo.SelectOneHealthInstanceParam{
+		ServiceName: req.ID,
+	}
 	service, err := r.client.SelectOneHealthyInstance(params)
 	if err != nil {
 		return "", fmt.Errorf("failed to query healthy nacos services: %w", err)
@@ -152,5 +171,7 @@ func (r *resolver) ResolveID(req nameresolution.ResolveRequest) (string, error) 
 	if service == nil {
 		return "", fmt.Errorf("no healthy services found with AppID:%s", req.ID)
 	}
-	return "", nil
+
+	addr := fmt.Sprintf("%s:%d", service.Ip, service.Port)
+	return addr, nil
 }
